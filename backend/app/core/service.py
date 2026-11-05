@@ -20,7 +20,7 @@ from app.core.formats.registry import adapter_for, detect_format
 from app.core.formats.sniff import sanitized_filename
 from app.core.languages import known_language
 from app.core.model_registry import all_models, cost_cents, image_cost_cents, image_tokens, resolve_model
-from app.core.numbered import parse_numbered_blocks
+from app.core.numbered import parse_numbered_blocks, usable_translation
 from app.core.prompts import PROMPT_VERSION, SUMMARY_PROMPT, system_prompt, user_prompt
 from app.core.provider.base import TranslateRequest
 from app.core.provider.factory import build_ocr, build_provider, build_vision
@@ -435,6 +435,46 @@ def reap(session: Session) -> int:
     session.execute(
         text(
             """
+            UPDATE translation_jobs
+            SET status = 'translating', locked_by = NULL
+            WHERE status = 'reviewing' AND heartbeat_at < now() - make_interval(secs => :stale)
+            """
+        ),
+        {"stale": stale},
+    )
+    session.execute(
+        text(
+            """
+            UPDATE translation_jobs
+            SET locked_by = NULL
+            WHERE status = 'rendering'
+              AND locked_by IS NOT NULL
+              AND heartbeat_at < now() - make_interval(secs => :stale)
+            """
+        ),
+        {"stale": stale},
+    )
+    stuck_ocr = session.execute(
+        text(
+            """
+            SELECT id FROM translation_jobs
+            WHERE status = 'ocr'
+              AND heartbeat_at < now() - make_interval(secs => :stale)
+              AND NOT EXISTS (
+                SELECT 1 FROM ocr_pages p
+                WHERE p.job_id = translation_jobs.id AND p.status <> 'done'
+              )
+            """
+        ),
+        {"stale": stale},
+    ).scalars().all()
+    for job_id in stuck_ocr:
+        job = session.get(TranslationJob, job_id)
+        if job is not None and job.status == "ocr":
+            _advance_ocr_job(session, job)
+    session.execute(
+        text(
+            """
             UPDATE documents SET analysis_status = 'queued'
             WHERE analysis_status = 'running'
               AND created_at < now() - interval '30 minutes'
@@ -614,11 +654,22 @@ def _ocr_page(session: Session, job_id: uuid.UUID, page_no: int, worker_id: str)
     page_row = session.get(OcrPage, (job.id, page_no))
     page_row.status = "done"
     job.heartbeat_at = _now(session)
-    remaining = session.scalar(select(OcrPage).where(OcrPage.job_id == job.id, OcrPage.status != "done"))
     logger.info("ocr_page_done", page=page_no, blocks=len(result.blocks))
+    _advance_ocr_job(session, job)
+
+
+def _advance_ocr_job(session: Session, job: TranslationJob) -> None:
+    session.flush()
+    remaining = session.execute(
+        text("SELECT count(*) FROM ocr_pages WHERE job_id = :job AND status <> 'done'"),
+        {"job": job.id},
+    ).scalar()
     if remaining:
         return
-    text_left = session.scalar(select(Block).where(Block.document_id == document.id, Block.kind != "image", Block.text.is_not(None), Block.text != ""))
+    document = session.get(Document, job.document_id)
+    text_left = session.scalar(
+        select(Block).where(Block.document_id == document.id, Block.kind != "image", Block.text.is_not(None), Block.text != "")
+    )
     if text_left is None:
         empty_pages = [row.page_no for row in session.scalars(select(OcrPage).where(OcrPage.job_id == job.id))]
         _fail(session, job, "ocr_no_text", f"No readable text was found on pages {', '.join(str(n) for n in empty_pages)}.")
@@ -768,7 +819,7 @@ def _translate_segment(session: Session, segment_id: uuid.UUID, worker_id: str) 
         _copy_duplicate_hashes(session, job, rows)
         segment.status = "done"
         segment.locked_by = None
-        job.done_segments = (job.done_segments or 0) + 1
+        _add_progress(session, job, segments=1)
         logger.info("segment_skipped_tm")
         return
     spec = resolve_model(segment.model)
@@ -804,25 +855,45 @@ def _translate_segment(session: Session, segment_id: uuid.UUID, worker_id: str) 
             segment.locked_by = None
         return
     found, missing, extra = parse_numbered_blocks(result.text, [number for number, _ in pairs])
-    if missing:
-        found = {number: f"[{job.target_lang}] {pending[number - 1].text}" for number, _ in pairs}
-    by_hash: dict[str, str] = {}
+    if missing and segment.attempt < get_settings().segment_attempt_limit:
+        _add_progress(
+            session,
+            job,
+            tokens_in=result.tokens_in,
+            tokens_out=result.tokens_out,
+            cost=cost_cents(spec, result.tokens_in, result.tokens_out),
+        )
+        segment.status = "pending"
+        segment.locked_by = None
+        logger.info("segment_incomplete", missing=missing)
+        _check_cap(session, job)
+        return
+    by_hash: dict[str, tuple[str, bool]] = {}
     for number, row in zip([n for n, _ in pairs], pending):
-        translated = found.get(number) or row.text
-        by_hash[row.src_hash] = translated
+        translated = usable_translation(found.get(number), row.text or "", job.target_lang)
+        remembered = translated is not None
+        if translated is None:
+            translated = row.text or ""
+        by_hash[row.src_hash] = (translated, remembered)
         _upsert_translation(session, job.id, row.idx, translated, "model", segment.id)
-        _tm_put(session, row.src_hash, job.source_lang or "en", job.target_lang, translated, spec.alias)
+        if remembered:
+            _tm_put(session, row.src_hash, job.source_lang or "en", job.target_lang, translated, spec.alias)
     for row in rows:
         if row.src_hash in by_hash and session.get(BlockTranslation, (job.id, row.idx)) is None:
-            _upsert_translation(session, job.id, row.idx, by_hash[row.src_hash], "model", segment.id)
+            translated, _remembered = by_hash[row.src_hash]
+            _upsert_translation(session, job.id, row.idx, translated, "model", segment.id)
     segment.status = "done"
     segment.locked_by = None
     segment.tokens_in = result.tokens_in
     segment.tokens_out = result.tokens_out
-    job.done_segments = (job.done_segments or 0) + 1
-    job.tokens_in = (job.tokens_in or 0) + result.tokens_in
-    job.tokens_out = (job.tokens_out or 0) + result.tokens_out
-    _add_cost(session, job, spec.alias, result.tokens_in, result.tokens_out)
+    _add_progress(
+        session,
+        job,
+        segments=1,
+        tokens_in=result.tokens_in,
+        tokens_out=result.tokens_out,
+        cost=cost_cents(spec, result.tokens_in, result.tokens_out),
+    )
     SEGMENT_LATENCY.labels(stage="translate").observe(time.perf_counter() - started)
     logger.info("segment_done", segment=segment.idx, tokens_in=result.tokens_in, tokens_out=result.tokens_out)
     _check_cap(session, job)
@@ -1135,16 +1206,45 @@ def _record(**kwargs) -> None:
         COST.labels(stage=stage, model=model).inc(float(cents))
 
 
+def _add_progress(
+    session: Session,
+    job: TranslationJob,
+    *,
+    segments: int = 0,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    cost: Decimal | None = None,
+) -> None:
+    cents = cost if cost is not None else Decimal(0)
+    if not segments and not tokens_in and not tokens_out and cents == 0:
+        return
+    session.execute(
+        text(
+            """
+            UPDATE translation_jobs
+            SET done_segments = COALESCE(done_segments, 0) + :segments,
+                tokens_in = COALESCE(tokens_in, 0) + :tokens_in,
+                tokens_out = COALESCE(tokens_out, 0) + :tokens_out,
+                cost_cents = COALESCE(cost_cents, 0) + :cost
+            WHERE id = :id
+            """
+        ),
+        {"segments": segments, "tokens_in": tokens_in, "tokens_out": tokens_out, "cost": cents, "id": job.id},
+    )
+    session.expire(job, ["done_segments", "tokens_in", "tokens_out", "cost_cents"])
+
+
 def _add_cost(session: Session, job: TranslationJob, model: str, tokens_in: int, tokens_out: int) -> None:
     try:
         spec = resolve_model(model)
     except AppError:
         return
-    job.cost_cents = (job.cost_cents or Decimal(0)) + cost_cents(spec, tokens_in, tokens_out)
+    _add_progress(session, job, cost=cost_cents(spec, tokens_in, tokens_out))
 
 
 def _check_cap(session: Session, job: TranslationJob) -> None:
     cap = Decimal(str(get_settings().max_job_cost_cents))
+    session.refresh(job, attribute_names=["cost_cents"])
     if (job.cost_cents or 0) > cap:
         raise_cost = CostCapExceeded(str(job.cost_cents), str(cap))
         _fail(session, job, raise_cost.code, raise_cost.message)

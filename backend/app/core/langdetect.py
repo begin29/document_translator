@@ -13,7 +13,7 @@ _COMMON = {
 }
 
 
-def detect_language(text: str) -> str | None:
+def detect_language(text: str, *, fallback_en: bool = True) -> str | None:
     sample = (text or "")[:8000]
     if not sample.strip():
         return None
@@ -38,7 +38,7 @@ def detect_language(text: str) -> str | None:
     best = max(scores, key=scores.get)
     if scores[best] >= 2:
         return best
-    if letters > 20:
+    if letters > 20 and fallback_en:
         return "en"
     return None
 

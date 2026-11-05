@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.core.analysis.page_classifier import classify_page, contrast_spread, laplacian_variance
 from app.core.analysis.preprocess import preprocess_page
@@ -10,7 +11,7 @@ from app.core.chunking import chunk_blocks, segment_budget
 from app.core.domain import BlockData
 from app.core.formats.sniff import sniff_format
 from app.core.model_registry import ModelSpec, cost_cents
-from app.core.numbered import parse_numbered_blocks
+from app.core.numbered import parse_numbered_blocks, usable_translation
 from app.core.quality import flags_for
 from app.core.errors import AppError
 import pytest
@@ -91,6 +92,14 @@ def test_flags_detect_untranslated_and_glossary():
     assert "untranslated" in flags_for("Hello", "Hello", "en", "de", [])
     assert "glossary" in flags_for("Use Stark VARG today", "Nutze das Fahrrad heute", "en", "de", [{"source": "Stark VARG", "target": "Stark VARG"}])
     assert flags_for("Hello", "Hallo", "en", "de", []) == []
+    english = "The motor is quiet and the chain is ready for the long ride."
+    assert "script" in flags_for("Workshop notes about the sealed drivetrain.", english, "en", "de", [])
+    italian = "Il motore resta sigillato durante la giornata di guida sul sentiero."
+    assert "script" not in flags_for("The sealed motor stays quiet on the trail.", italian, "en", "it", [])
+    assert usable_translation(english, "Workshop notes about the sealed drivetrain.", "de") is None
+    assert usable_translation("Hello", "Hello", "de") is None
+    assert usable_translation("[de] Hello", "Hello", "de") == "[de] Hello"
+    assert usable_translation("Der Motor ist leise und die Kette ist bereit.", "The motor is quiet.", "de") == "Der Motor ist leise und die Kette ist bereit."
 
 
 def test_sniff_rejects_edges():
@@ -112,6 +121,38 @@ def _image(draw) -> Image.Image:
     return image
 
 
+def _body_font(size: int) -> ImageFont.ImageFont:
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ):
+        if Path(candidate).exists():
+            return ImageFont.truetype(candidate, size)
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _sparse_page(blur: int = 0) -> Image.Image:
+    image = Image.new("RGB", (1600, 2100), "white")
+    draw = ImageDraw.Draw(image)
+    face = _body_font(56)
+    y = 160
+    for line in (
+        "This scanned page describes the rear axle and the chain.",
+        "Torque stays available from the first corner.",
+        "Check the torque values before riding.",
+    ):
+        draw.text((90, y), line, fill="black", font=face)
+        y += 84
+    if blur:
+        image = image.filter(ImageFilter.GaussianBlur(blur))
+    return image
+
+
 def test_classifier_pages():
     sharp = _image(lambda draw: [draw.line([(40, y), (760, y)], fill="black", width=3) for y in range(80, 900, 28)])
     assert classify_page("", sharp, 1, 300)[0] == "scanned_good"
@@ -121,6 +162,10 @@ def test_classifier_pages():
     assert classify_page("", blank, 1, 300)[0] == "blank"
     low = Image.new("RGB", (400, 400), (180, 180, 180))
     assert classify_page("", low, 1, 300)[0] in {"blank", "scanned_poor", "unknown"}
+    sparse = _sparse_page()
+    assert classify_page("", sparse, 1, 300)[0] == "scanned_good"
+    assert classify_page("", _sparse_page(10), 1, 300)[0] == "scanned_poor"
+    assert classify_page("", sparse, 1, 72)[0] == "scanned_poor"
     skewed = sharp.rotate(12, expand=True, fillcolor="white")
     assert classify_page("", skewed, 1, 300)[0] == "scanned_poor"
     abstract = Image.new("RGB", (400, 400), "white")
@@ -142,6 +187,38 @@ def test_preprocess_improves_blurry_scan():
     improved = preprocess_page(image, 1200)
     assert laplacian_variance(improved) >= before_blur * 0.5
     assert contrast_spread(improved) >= before_contrast
+
+
+def test_fake_ocr_follows_ink():
+    from app.core.analysis.page_classifier import png_bytes
+    from app.core.ocr.fake_ocr import FakeOcrProvider
+
+    ocr = FakeOcrProvider()
+    sharp = ocr.transcribe(png_bytes(_sparse_page()), "")
+    assert sharp.blocks and sharp.blocks[0].text.startswith("Transcribed")
+    soft = ocr.transcribe(png_bytes(_sparse_page(10)), "")
+    assert soft.blocks and soft.blocks[0].text == "[illegible]"
+    blank = ocr.transcribe(png_bytes(Image.new("RGB", (400, 400), "white")), "")
+    assert blank.blocks == []
+
+
+def test_pdf_scan_routes_to_ocr(tmp_path):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    from app.core.formats.pdf import PdfAdapter
+
+    image_path = tmp_path / "scan.png"
+    _sparse_page().save(image_path)
+    src = tmp_path / "scan.pdf"
+    page_w, page_h = A4
+    drawing = canvas.Canvas(str(src), pagesize=A4)
+    drawing.drawImage(str(image_path), 0, 0, width=page_w, height=page_h, preserveAspectRatio=True, anchor="c")
+    drawing.showPage()
+    drawing.save()
+    page = PdfAdapter().extract(src, tmp_path).pages[0]
+    assert page.page_class == "scanned_good"
+    assert page.route == "ocr"
 
 
 def test_pdf_round_trip_keeps_image(tmp_path):

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 
+from app.core.domain import normalize_text
+
 
 def parse_numbered_blocks(raw: str, expected: list[int]) -> tuple[dict[int, str], list[int], list[int]]:
     found: dict[int, str] = {}
@@ -18,6 +20,21 @@ def parse_numbered_blocks(raw: str, expected: list[int]) -> tuple[dict[int, str]
     missing = [n for n in expected if n not in found or not found[n]]
     extra = [n for n in found if n not in expected]
     return found, missing, extra
+
+
+def usable_translation(text: str | None, source: str, target_lang: str | None = None) -> str | None:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    if normalize_text(cleaned) == normalize_text(source):
+        return None
+    if target_lang:
+        from app.core.quality import flags_for
+
+        reasons = flags_for(source, cleaned, None, target_lang, [])
+        if "untranslated" in reasons or "script" in reasons:
+            return None
+    return cleaned
 
 
 def _json_blocks(text: str) -> dict[int, str] | None:

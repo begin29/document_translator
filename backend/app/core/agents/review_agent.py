@@ -26,12 +26,21 @@ def review_job(session: Session, job: TranslationJob, provider) -> bool:
     if get_settings().provider == "openai":
         try:
             _run_agent(session, job, flagged)
-            return True
+            return _still_flagged(session, job, flagged)
         except Exception:
             pass
     for segment, reasons in flagged:
         _retranslate(session, job, segment, provider, "; ".join(reasons))
-        segment.review_state = "retried"
+    return _still_flagged(session, job, flagged)
+
+
+def _still_flagged(session: Session, job: TranslationJob, flagged: list[tuple[Segment, list[str]]]) -> bool:
+    for segment, _reasons in flagged:
+        source, target = _segment_text(session, job, segment)
+        if flags_for(source, target, job.source_lang, job.target_lang, job.glossary):
+            segment.review_state = "flagged"
+        elif segment.review_state != "accepted":
+            segment.review_state = "retried"
     return True
 
 
@@ -89,12 +98,14 @@ def _retranslate(session: Session, job: TranslationJob, segment: Segment, provid
         result = _call_with_retries(session, request)
     finally:
         _release()
-    from app.core.numbered import parse_numbered_blocks
+    from app.core.numbered import parse_numbered_blocks, usable_translation
 
     found, _, _ = parse_numbered_blocks(result.text, [number for number, _ in pairs])
     text_rows = [row for row in rows if row.text]
     for number, row in zip([n for n, _ in pairs], text_rows):
-        translated = found.get(number) or row.text
+        translated = usable_translation(found.get(number), row.text or "", job.target_lang)
+        if translated is None:
+            continue
         _upsert_translation(session, job.id, row.idx, translated, "agent", segment.id)
         _tm_put(session, row.src_hash, job.source_lang or "en", job.target_lang, translated, get_settings().review_model)
     _add_cost(session, job, get_settings().review_model, result.tokens_in, result.tokens_out)

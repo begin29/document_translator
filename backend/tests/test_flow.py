@@ -226,6 +226,52 @@ def test_reaper_requeues_stale_segment(session, tmp_path):
     assert segment.status == "pending"
 
 
+def test_reaper_recovers_review_render_and_ocr(session, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from app.db.models import OcrPage
+
+    path = tmp_path / "reap-stages.pdf"
+    _pdf(path, ["Reaper should release a review, a render lock, and a finished OCR job."])
+    document = create_document(session, "reap-stages.pdf", path.read_bytes())
+    session.commit()
+    run_analysis(session, document.id)
+    session.commit()
+    job = create_job(session, document.id, "de", None, None, None, None)
+    session.commit()
+    _drain(session)
+    session.refresh(job)
+    assert job.status == "done"
+    stale = datetime.now(timezone.utc) - timedelta(hours=2)
+    job.status = "reviewing"
+    job.locked_by = "dead-worker"
+    job.heartbeat_at = stale
+    session.commit()
+    reap(session)
+    session.commit()
+    session.refresh(job)
+    assert job.status == "translating"
+    assert job.locked_by is None
+    job.status = "rendering"
+    job.locked_by = "dead-worker"
+    job.heartbeat_at = stale
+    session.commit()
+    reap(session)
+    session.commit()
+    session.refresh(job)
+    assert job.status == "rendering"
+    assert job.locked_by is None
+    job.status = "ocr"
+    job.locked_by = "dead-worker"
+    job.heartbeat_at = stale
+    session.add(OcrPage(job_id=job.id, page_no=1, status="done"))
+    session.commit()
+    reap(session)
+    session.commit()
+    session.refresh(job)
+    assert job.status != "ocr"
+
+
 def test_api_and_mcp_estimate(session, tmp_path):
     from fastapi.testclient import TestClient
 
