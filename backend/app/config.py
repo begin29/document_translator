@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,10 +12,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://translator:translator@localhost:5432/translator"
     files_dir: str = "./data"
     provider: str = "fake"
-    openai_api_key: str = Field(
-        default="",
-        validation_alias=AliasChoices("OPENAI_API_KEY", "OPEN_AI_API_KEY"),
-    )
+    openai_api_key: str = ""
     app_env: str = "dev"
     max_upload_mb: int = 40
     max_job_cost_cents: float = 2000

@@ -16,7 +16,7 @@ class OpenAIProvider:
         if settings.app_env == "test":
             raise RuntimeError("OpenAIProvider cannot be constructed when APP_ENV=test")
         if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY or OPEN_AI_API_KEY is required when PROVIDER=openai")
+            raise RuntimeError("OPENAI_API_KEY is required when PROVIDER=openai")
         from openai import OpenAI
 
         self.client = OpenAI(api_key=settings.openai_api_key, timeout=90, max_retries=0)

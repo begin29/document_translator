@@ -16,7 +16,7 @@ backend/.venv/
 dist/
 node_modules/
 frontend/dist/
-docs/fixtures/generated/
+docs/
 *.log
 .DS_Store
 uv.lock
