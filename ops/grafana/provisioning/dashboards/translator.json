@@ -1,0 +1,41 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Queue depth",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "translator_queue_depth", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": null}
+    },
+    {
+      "type": "timeseries",
+      "title": "Provider tokens by stage",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "sum by (stage) (rate(provider_tokens_total[5m]))", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": null}
+    },
+    {
+      "type": "timeseries",
+      "title": "Cost cents by stage",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{"expr": "sum by (stage) (provider_cost_cents_total)", "refId": "A"}],
+      "datasource": {"type": "prometheus", "uid": null}
+    },
+    {
+      "type": "timeseries",
+      "title": "429s and inflight",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "provider_rate_limits_total", "refId": "A"},
+        {"expr": "provider_inflight", "refId": "B"}
+      ],
+      "datasource": {"type": "prometheus", "uid": null}
+    }
+  ],
+  "schemaVersion": 39,
+  "title": "Stark Translator",
+  "uid": "stark-translator",
+  "version": 1
+}

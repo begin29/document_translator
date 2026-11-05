@@ -1,0 +1,96 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: translator
+      POSTGRES_PASSWORD: translator
+      POSTGRES_DB: translator
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U translator -d translator"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://translator:translator@db:5432/translator
+      FILES_DIR: /data
+      MODELS_CONFIG: /app/models.yaml
+    volumes:
+      - files:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["sh", "-c", "alembic upgrade head && python -m app.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://translator:translator@db:5432/translator
+      FILES_DIR: /data
+      MODELS_CONFIG: /app/models.yaml
+    volumes:
+      - files:/data
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  langfuse:
+    image: langfuse/langfuse:2
+    profiles: ["observability"]
+    environment:
+      DATABASE_URL: postgresql://translator:translator@db:5432/translator
+      NEXTAUTH_SECRET: dev-only-change-me
+      SALT: dev-only-salt
+      NEXTAUTH_URL: http://localhost:3001
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "3001:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  files:

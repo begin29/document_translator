@@ -1,0 +1,27 @@
+models:
+  - id: gpt-4o-mini-2024-07-18
+    alias: gpt-4o-mini
+    tokenizer: o200k_base
+    context_window: 128000
+    max_output_tokens: 16384
+    input_price_per_1m: 0.15
+    output_price_per_1m: 0.60
+    quality_tier: fast
+    supports_vision: true
+    image_base_tokens: 2833
+    image_tokens_per_tile: 5667
+    image_token_multiplier: 1
+    uses_max_completion_tokens: true
+  - id: gpt-4o-2024-08-06
+    alias: gpt-4o
+    tokenizer: o200k_base
+    context_window: 128000
+    max_output_tokens: 16384
+    input_price_per_1m: 2.50
+    output_price_per_1m: 10.00
+    quality_tier: best
+    supports_vision: true
+    image_base_tokens: 85
+    image_tokens_per_tile: 170
+    image_token_multiplier: 1
+    uses_max_completion_tokens: true
