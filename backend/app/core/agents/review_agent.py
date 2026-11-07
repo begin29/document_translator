@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -8,6 +10,13 @@ from app.core.prompts import PROMPT_VERSION, system_prompt, user_prompt
 from app.core.provider.base import TranslateRequest
 from app.core.quality import flags_for
 from app.db.models import Block, BlockTranslation, Segment, TranslationJob
+from app.observability.logging import get_logger
+
+log = get_logger()
+
+
+def _agent_enabled() -> bool:
+    return get_settings().provider == "openai"
 
 
 def review_job(session: Session, job: TranslationJob, provider) -> bool:
@@ -23,12 +32,17 @@ def review_job(session: Session, job: TranslationJob, provider) -> bool:
             segment.review_state = "accepted"
     if not flagged:
         return False
-    if get_settings().provider == "openai":
+    if _agent_enabled():
         try:
-            _run_agent(session, job, flagged)
+            ran = _run_agent(session, job, flagged, provider)
+        except Exception as exc:
+            log.bind(job_id=str(job.id), stage="review").warning("review_agent_failed", error=str(exc))
+            from app.core.service import _event
+
+            _event(session, job.id, "review_agent_failed", {"error": str(exc)[:500]}, level="warning")
+            ran = False
+        if ran:
             return _still_flagged(session, job, flagged)
-        except Exception:
-            pass
     for segment, reasons in flagged:
         _retranslate(session, job, segment, provider, "; ".join(reasons))
     return _still_flagged(session, job, flagged)
@@ -166,11 +180,96 @@ class ReviewToolkit:
         return segment
 
 
-def _run_agent(session: Session, job: TranslationJob, flagged: list[tuple[Segment, list[str]]]) -> None:
-    from agents import Agent, Runner, function_tool
+def _clip(text: str, limit: int = 1500) -> str:
+    return (text or "")[:limit]
 
-    toolkit = ReviewToolkit(session, job, None)
+
+def _flagged_prompt(session: Session, job: TranslationJob, flagged: list[tuple[Segment, list[str]]]) -> str:
+    lines = ["Review these flagged segments:"]
+    for segment, reasons in flagged:
+        source, target = _segment_text(session, job, segment)
+        lines.append(
+            "\n".join(
+                [
+                    f"segment {segment.idx}",
+                    f"reasons: {_clip(', '.join(reasons))}",
+                    f"source: {_clip(source)}",
+                    f"target: {_clip(target)}",
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def _usage_counts(usage) -> tuple[int, int, int]:
+    if usage is None:
+        return 0, 0, 0
+    if isinstance(usage, dict):
+        details = usage.get("input_tokens_details") or {}
+        cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", 0)
+        return int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), int(cached or 0)
+    details = getattr(usage, "input_tokens_details", None)
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens") or 0
+    else:
+        cached = getattr(details, "cached_tokens", 0) if details is not None else 0
+    return int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0), int(cached or 0)
+
+
+def _raw_responses(source) -> list:
+    direct = getattr(source, "raw_responses", None)
+    if direct:
+        return list(direct)
+    details = getattr(source, "run_data", None)
+    nested = getattr(details, "raw_responses", None) if details is not None else None
+    if nested:
+        return list(nested)
+    return []
+
+
+def _record_agent_usage(session: Session, job: TranslationJob, model: str, responses: list, started: float) -> None:
+    if not responses:
+        return
+    from app.core.service import _add_cost, _record
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    share = elapsed_ms // len(responses)
+    for response in responses:
+        tokens_in, tokens_out, tokens_cached = _usage_counts(getattr(response, "usage", None))
+        _record(
+            stage="review_agent",
+            model=model,
+            job_id=job.id,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            tokens_cached=tokens_cached,
+            latency_ms=share,
+            status="ok",
+        )
+        _add_cost(session, job, model, tokens_in, tokens_out)
+
+
+def _run_agent(session: Session, job: TranslationJob, flagged: list[tuple[Segment, list[str]]], provider) -> bool:
+    from app.core.service import _release, _try_acquire
+
+    if not _try_acquire(2000):
+        return False
+    toolkit = ReviewToolkit(session, job, provider)
     spec_model = get_settings().review_model
+    started = time.perf_counter()
+    try:
+        result = _run_agent_body(session, job, flagged, toolkit, spec_model)
+        _record_agent_usage(session, job, spec_model, _raw_responses(result), started)
+    except Exception as exc:
+        _record_agent_usage(session, job, spec_model, _raw_responses(exc), started)
+        raise
+    finally:
+        _release()
+    return True
+
+
+def _run_agent_body(session, job, flagged, toolkit, spec_model):
+    from agents import Agent, ModelSettings, Runner, function_tool
 
     @function_tool
     def get_source_segment(segment_idx: int) -> str:
@@ -218,6 +317,10 @@ def _run_agent(session: Session, job: TranslationJob, flagged: list[tuple[Segmen
             view_source_page_image,
         ],
         model=spec_model,
+        model_settings=ModelSettings(temperature=0),
     )
-    lines = [f"segment {segment.idx}: {', '.join(reasons)}" for segment, reasons in flagged]
-    Runner.run_sync(agent, "Review these flagged segments:\n" + "\n".join(lines))
+    return Runner.run_sync(
+        agent,
+        _flagged_prompt(session, job, flagged),
+        max_turns=4 + 2 * len(flagged),
+    )
