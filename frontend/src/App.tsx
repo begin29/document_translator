@@ -1,6 +1,6 @@
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
-import { ApiError, DocumentRecord, JobRecord, SegmentRecord, request } from "./api";
+import { ApiError, DocumentRecord, EstimateModel, JobRecord, SegmentRecord, request } from "./api";
 import { AuthProvider, LoginPage, RegisterPage, RequireAuth, TokensPage, useAuth } from "./auth";
 import { errorMessage, progressLabel } from "./copy";
 import { applySnapshot, isTerminal, mergeState, useEventStream } from "./useEventStream";
@@ -31,6 +31,12 @@ function formatStamp(value: string | null | undefined): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return "";
   return parsed.toLocaleString();
+}
+
+function signedPercent(spent: number, estimate: number): string {
+  const pct = Math.round(((spent - estimate) / estimate) * 100);
+  if (pct > 0) return `+${pct}%`;
+  return `${pct}%`;
 }
 
 function readFailure(err: unknown): { code?: string; detail?: string } {
@@ -231,6 +237,7 @@ function DocumentPage() {
   const [target, setTarget] = useState("de");
   const [mode, setMode] = useState("reflow");
   const [languages, setLanguages] = useState<{ code: string; name: string }[]>([]);
+  const [quotes, setQuotes] = useState<EstimateModel[] | null>(null);
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
   const idRef = useRef(id);
   idRef.current = id;
@@ -241,8 +248,28 @@ function DocumentPage() {
 
   useEffect(() => {
     setDocument(null);
+    setQuotes(null);
     setError(null);
   }, [id]);
+
+  useEffect(() => {
+    const documentId = id;
+    if (!documentId || document?.analysis_status !== "ready") return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      request<{ models: EstimateModel[] }>(`/api/documents/${documentId}/estimate?target_lang=${encodeURIComponent(target)}`)
+        .then((body) => {
+          if (!cancelled && idRef.current === documentId) setQuotes(body.models);
+        })
+        .catch((err) => {
+          if (!cancelled && idRef.current === documentId) setError(readFailure(err));
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [id, target, document?.analysis_status]);
 
   async function refreshDocument() {
     const documentId = idRef.current;
@@ -336,7 +363,7 @@ function DocumentPage() {
               </select>
             </label>
             <div className="mt-4 space-y-2">
-              {document.analysis.models.map((item) => (
+              {(quotes ?? document.analysis.models).map((item) => (
                 <label key={item.model} className={`block border p-3 text-sm ${model === item.model ? "border-stark-gold" : "border-white/10"}`}>
                   <input type="radio" name="model" className="mr-2" checked={model === item.model} onChange={() => setModel(item.model)} />
                   {item.model} · {item.tier}
@@ -452,7 +479,14 @@ function JobPage() {
       <div className="mt-4 h-1 bg-white/10">
         <div className="h-1 bg-stark-gold" style={{ width: `${Math.min(ratio, 100)}%` }} />
       </div>
-      {job && <p className="mt-3 text-sm text-stark-gray">Spent ${(job.cost_cents / 100).toFixed(4)} · {job.model} · {job.target_lang}</p>}
+      {job && (
+        <p className="mt-3 text-sm text-stark-gray">
+          {job.estimate_cents != null && <>Estimated ${(job.estimate_cents / 100).toFixed(4)} · </>}
+          Spent ${(job.cost_cents / 100).toFixed(4)}
+          {job.status === "done" && job.estimate_cents ? ` · ${signedPercent(job.cost_cents, job.estimate_cents)}` : ""}
+          {` · ${job.model} · ${job.target_lang}`}
+        </p>
+      )}
       {job?.quality_warning && <p className="mt-3 text-sm text-stark-gold">A reviewer retranslated at least one segment because the first pass failed a quality check.</p>}
       {job?.error_code && <div className="mt-4"><ErrorPanel code={job.error_code} detail={job.error_detail} /></div>}
       {cost && (

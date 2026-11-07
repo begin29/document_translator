@@ -92,6 +92,19 @@ export type DocumentRecord = {
   seq?: number;
 };
 
+export type EstimateModel = {
+  model: string;
+  tier: string;
+  segments: number;
+  tokens_in: number;
+  tokens_out: number;
+  tm_hits: number;
+  cost_cents: number;
+  ocr_cost_cents: number;
+  summary_cost_cents: number;
+  duration_seconds: number;
+};
+
 export type JobRecord = {
   id: string;
   document_id: string;
@@ -103,6 +116,7 @@ export type JobRecord = {
   total_segments: number;
   done_segments: number;
   cost_cents: number;
+  estimate_cents: number | null;
   error_code: string | null;
   error_detail: string | null;
   output_stale: boolean;

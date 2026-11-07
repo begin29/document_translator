@@ -19,8 +19,8 @@ from app.core.errors import AppError, CostCapExceeded, InjectedCrash, RateLimite
 from app.core.events import after_commit, publish_document, publish_job
 from app.core.formats.registry import adapter_for, detect_format
 from app.core.formats.sniff import sanitized_filename
-from app.core.languages import known_language
-from app.core.model_registry import all_models, cost_cents, image_cost_cents, image_tokens, resolve_model
+from app.core.languages import expansion_ratio, known_language
+from app.core.model_registry import all_models, cached_input_price, cost_cents, image_cost_cents, image_tokens, resolve_model
 from app.core.numbered import parse_numbered_blocks, usable_translation
 from app.core.prompts import PROMPT_VERSION, SUMMARY_PROMPT, system_prompt, user_prompt
 from app.core.provider.base import TranslateRequest
@@ -135,7 +135,7 @@ def run_analysis(session: Session, document_id: uuid.UUID) -> None:
                 block.idx = block.page * 100000 + block.seq
                 session.add(_block_row(document.id, block))
             char_count = sum(len(block.text or "") for block in ordered)
-            analysis = _analysis_payload(extracted, ordered)
+            analysis = _analysis_payload(session, document, extracted)
             document.page_count = extracted.page_count
             document.char_count = char_count
             document.detected_source_lang = extracted.detected_source_lang
@@ -195,49 +195,129 @@ def _apply_tier1(session: Session, document: Document, extracted) -> None:
         )
 
 
-def _analysis_payload(extracted, blocks: list[BlockData]) -> dict:
+def _fit_tokens(spec, target: int, seed: str) -> str:
+    if target <= 0:
+        return ""
+    low = 1
+    high = max(target * 3, 4)
+    best = seed
+    while low <= high:
+        mid = (low + high) // 2
+        text = " ".join([seed] * mid)
+        size = count_tokens(spec, text)
+        if size <= target:
+            best = text
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _estimate_pairs(blocks: list[BlockData]) -> list[tuple[int, str]]:
+    pairs: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    number = 1
+    for block in blocks:
+        if block.kind == "image" or not block.text:
+            continue
+        if block.src_hash in seen:
+            continue
+        seen.add(block.src_hash)
+        pairs.append((number, block.text))
+        number += 1
+    return pairs
+
+
+def estimate_for(
+    session: Session,
+    document: Document,
+    target_lang: str,
+    model_alias: str,
+    glossary: list[dict] | None = None,
+    *,
+    source_lang: str | None = None,
+    expansion: float | None = None,
+    apply_tm: bool = True,
+) -> dict:
+    settings = get_settings()
+    spec = resolve_model(model_alias)
+    source = document.detected_source_lang if source_lang is None else source_lang
+    target = (target_lang or "").lower()
+    ratio = expansion_ratio(source, target) if expansion is None else expansion
+    rows = session.scalars(
+        select(Block).where(Block.document_id == document.id).order_by(Block.page, Block.seq, Block.idx)
+    ).all()
+    blocks = [_from_row(row) for row in rows if row.kind != "image"]
+    tm_source = (source or "en").lower()
+    tm_hits = 0
+    kept: list[BlockData] = []
+    for block in blocks:
+        if apply_tm and block.text:
+            hit = _tm_get(session, document.owner_id, block.src_hash, tm_source, target, count_hit=False)
+            if hit is not None:
+                tm_hits += 1
+                continue
+        kept.append(block)
+    ocr_pages = list((document.analysis or {}).get("ocr_pages") or [])
+    for page_no in ocr_pages:
+        kept.append(BlockData.make(page=int(page_no), seq=9000 + int(page_no), kind="paragraph", text=_fit_tokens(spec, 600, f"ocr{page_no}")))
+    budget = segment_budget(spec, source, target, settings.prompt_overhead_tokens, settings.global_quality_cap)
+    groups = chunk_blocks(kept, budget, lambda value: count_tokens(spec, value))
+    system = system_prompt(source or "auto", target, glossary, _fit_tokens(spec, 200, "summary"))
+    system_tokens = count_tokens(spec, system)
+    tokens_in = 0
+    tokens_out = 0
+    for chunk in groups:
+        pairs = _estimate_pairs(chunk.blocks)
+        if not pairs:
+            continue
+        tokens_in += system_tokens + count_tokens(spec, user_prompt(pairs))
+        block_tokens = sum(count_tokens(spec, text) for _, text in pairs)
+        tokens_out += int(block_tokens * ratio) + 8 * len(pairs)
+    excerpt_rows = session.scalars(
+        select(Block.text).where(Block.document_id == document.id, Block.text.is_not(None)).limit(8)
+    ).all()
+    excerpt = "\n".join(text for text in excerpt_rows if text)[:4000]
+    summary_cents = Decimal(0)
+    if excerpt:
+        summary_spec = resolve_model(settings.default_model)
+        summary_in = count_tokens(summary_spec, SUMMARY_PROMPT) + count_tokens(summary_spec, excerpt)
+        summary_cents = cost_cents(summary_spec, summary_in, 250)
+    ocr_spec = resolve_model(settings.ocr_model)
+    ocr_cents = Decimal(0)
+    for _page in ocr_pages:
+        ocr_cents += image_cost_cents(ocr_spec, 1500, 2000, "high")
+    total = cost_cents(spec, tokens_in, tokens_out) + ocr_cents + summary_cents
+    duration = round(max(len(groups), 1) / max(settings.job_max_concurrency, 1) * 20, 1)
+    return {
+        "model": spec.alias,
+        "tier": spec.quality_tier,
+        "segments": len(groups),
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tm_hits": tm_hits,
+        "cost_cents": total,
+        "ocr_cost_cents": ocr_cents,
+        "summary_cost_cents": summary_cents,
+        "duration_seconds": duration,
+    }
+
+
+def public_estimate(quote: dict) -> dict:
+    data = dict(quote)
+    for key in ("cost_cents", "ocr_cost_cents", "summary_cost_cents"):
+        data[key] = float(data[key])
+    return data
+
+
+def _analysis_payload(session: Session, document: Document, extracted) -> dict:
     settings = get_settings()
     counts: dict[str, int] = {}
     for page in extracted.pages:
         counts[page.page_class] = counts.get(page.page_class, 0) + 1
-    text = "\n".join(block.text or "" for block in blocks if block.text)
     ocr_pages = [page for page in extracted.pages if page.route in {"ocr", "ocr_enhance"}]
     ocr_spec = resolve_model(settings.ocr_model)
-    per_model = []
-    for spec in all_models():
-        tokens = count_tokens(spec, text)
-        synthetic = [
-            BlockData.make(page=block.page, seq=block.seq, kind=block.kind, text=block.text, meta=dict(block.meta))
-            for block in blocks
-            if block.kind != "image"
-        ]
-        for page in ocr_pages:
-            synthetic.append(BlockData.make(page=page.page, seq=9000, kind="paragraph", text="x " * 200))
-        budget = segment_budget(spec, extracted.detected_source_lang, "en", settings.prompt_overhead_tokens, settings.global_quality_cap)
-        groups = chunk_blocks(synthetic, budget, lambda value: count_tokens(spec, value))
-        ocr_cents = Decimal(0)
-        for page in ocr_pages:
-            ocr_cents += image_cost_cents(ocr_spec, 1500, 2000, "high")
-        translate_in = tokens + len(ocr_pages) * 400 + settings.prompt_overhead_tokens * max(len(groups), 1)
-        translate_out = int(translate_in * 0.8)
-        cents = cost_cents(spec, translate_in, translate_out) + ocr_cents
-        duration = round(max(len(groups), 1) / max(settings.job_max_concurrency, 1) * 20, 1)
-        per_model.append(
-            {
-                "model": spec.alias,
-                "model_id": spec.id,
-                "tier": spec.quality_tier,
-                "tokens": tokens,
-                "segments": len(groups),
-                "segment_budget": budget,
-                "cost_cents": float(cents),
-                "ocr_cost_cents": float(ocr_cents),
-                "duration_seconds": duration,
-                "input_price_per_1m": spec.input_price_per_1m,
-                "output_price_per_1m": spec.output_price_per_1m,
-            }
-        )
-    return {
+    payload = {
         "pages": [
             {
                 "page": page.page,
@@ -250,9 +330,34 @@ def _analysis_payload(extracted, blocks: list[BlockData]) -> dict:
         ],
         "class_counts": counts,
         "class_lines": _class_lines(extracted.pages, ocr_spec),
-        "models": per_model,
+        "models": [],
         "ocr_pages": [page.page for page in ocr_pages],
     }
+    document.analysis = payload
+    for spec in all_models():
+        quote = public_estimate(estimate_for(session, document, "en", spec.alias, expansion=1.3))
+        budget = segment_budget(spec, extracted.detected_source_lang, "en", settings.prompt_overhead_tokens, settings.global_quality_cap)
+        payload["models"].append(
+            {
+                "model": quote["model"],
+                "model_id": spec.id,
+                "tier": quote["tier"],
+                "tokens": quote["tokens_in"],
+                "segments": quote["segments"],
+                "segment_budget": budget,
+                "cost_cents": quote["cost_cents"],
+                "ocr_cost_cents": quote["ocr_cost_cents"],
+                "summary_cost_cents": quote["summary_cost_cents"],
+                "tokens_in": quote["tokens_in"],
+                "tokens_out": quote["tokens_out"],
+                "tm_hits": quote["tm_hits"],
+                "duration_seconds": quote["duration_seconds"],
+                "input_price_per_1m": spec.input_price_per_1m,
+                "output_price_per_1m": spec.output_price_per_1m,
+                "cached_input_price_per_1m": cached_input_price(spec),
+            }
+        )
+    return payload
 
 
 def _class_lines(pages, ocr_spec) -> list[dict]:
@@ -330,11 +435,13 @@ def create_job(
     source = source_lang or document.detected_source_lang
     if render_mode not in {"reflow", "layout"}:
         raise AppError("invalid_render_mode", "Render mode must be reflow or layout.", render_mode, False, 400)
+    target = target_lang.lower()
+    quote = estimate_for(session, document, target, spec.alias, glossary, source_lang=source)
     job = TranslationJob(
         document_id=document.id,
         owner_id=document.owner_id,
         source_lang=source,
-        target_lang=target_lang.lower(),
+        target_lang=target,
         model=spec.alias,
         glossary=glossary or [],
         idempotency_key=idempotency_key,
@@ -343,7 +450,11 @@ def create_job(
     )
     session.add(job)
     session.flush()
-    _event(session, job.id, "job_queued", {"model": spec.alias, "target": target_lang})
+    session.execute(
+        text("UPDATE translation_jobs SET estimate_cents = :cents WHERE id = :id"),
+        {"cents": quote["cost_cents"], "id": job.id},
+    )
+    _event(session, job.id, "job_queued", {"model": spec.alias, "target": target})
     return job
 
 
@@ -633,7 +744,7 @@ def _ocr_page(session: Session, job_id: uuid.UUID, page_no: int, worker_id: str)
         _fail(session, job, exc.code, exc.message)
         return
     if not result.already_recorded:
-        _record(
+        cents = _record(
             stage="ocr",
             model=get_settings().ocr_model,
             tokens_in=result.tokens_in,
@@ -646,7 +757,7 @@ def _ocr_page(session: Session, job_id: uuid.UUID, page_no: int, worker_id: str)
             job_id=job.id,
             page_no=page_no,
         )
-        _add_cost(session, job, get_settings().ocr_model, result.tokens_in, result.tokens_out)
+        _add_cost(session, job, get_settings().ocr_model, result.tokens_in, result.tokens_out, cents)
     session.execute(text("DELETE FROM blocks WHERE document_id = :doc AND page = :page AND kind <> 'image'"), {"doc": document.id, "page": page_no})
     for offset, block in enumerate(result.blocks):
         if not block.text.strip():
@@ -865,7 +976,7 @@ def _translate_segment(session: Session, segment_id: uuid.UUID, worker_id: str) 
             job,
             tokens_in=result.tokens_in,
             tokens_out=result.tokens_out,
-            cost=cost_cents(spec, result.tokens_in, result.tokens_out),
+            cost=_recorded_cost(result, spec),
         )
         segment.status = "pending"
         segment.locked_by = None
@@ -896,7 +1007,7 @@ def _translate_segment(session: Session, segment_id: uuid.UUID, worker_id: str) 
         segments=1,
         tokens_in=result.tokens_in,
         tokens_out=result.tokens_out,
-        cost=cost_cents(spec, result.tokens_in, result.tokens_out),
+        cost=_recorded_cost(result, spec),
     )
     SEGMENT_LATENCY.labels(stage="translate").observe(time.perf_counter() - started)
     logger.info("segment_done", segment=segment.idx, tokens_in=result.tokens_in, tokens_out=result.tokens_out)
@@ -1064,7 +1175,7 @@ def _call_with_retries(session: Session, request: TranslateRequest):
             request.attempt += 1
             delay = min(delay * 2, 2)
             continue
-        _record(
+        cents = _record(
             stage=request.stage,
             model=result.model or request.model,
             tokens_in=result.tokens_in,
@@ -1078,6 +1189,7 @@ def _call_with_retries(session: Session, request: TranslateRequest):
             segment_id=_uuid(request.segment_id),
             page_no=request.page_no,
         )
+        setattr(result, "recorded_cents", cents)
         return result
 
 
@@ -1105,7 +1217,7 @@ def _ensure_summary(session: Session, job: TranslationJob, document: Document) -
     try:
         result = _call_with_retries(session, request)
         job.summary = result.text[:1200]
-        _add_cost(session, job, request.model, result.tokens_in, result.tokens_out)
+        _add_cost(session, job, request.model, result.tokens_in, result.tokens_out, getattr(result, "recorded_cents", None))
     except AppError:
         job.summary = excerpt[:400]
     finally:
@@ -1176,13 +1288,23 @@ def _note_429() -> None:
         gate.commit()
 
 
-def _record(**kwargs) -> None:
+def _recorded_cost(result, spec) -> Decimal:
+    cents = getattr(result, "recorded_cents", None)
+    if isinstance(cents, Decimal):
+        return cents
+    return cost_cents(spec, result.tokens_in, result.tokens_out, getattr(result, "tokens_cached", 0) or 0)
+
+
+def _record(**kwargs) -> Decimal:
     spec = None
     try:
         spec = resolve_model(kwargs.get("model"))
     except AppError:
         spec = None
-    cents = cost_cents(spec, kwargs.get("tokens_in") or 0, kwargs.get("tokens_out") or 0) if spec and kwargs.get("status") == "ok" else Decimal(0)
+    tokens_in = kwargs.get("tokens_in") or 0
+    tokens_out = kwargs.get("tokens_out") or 0
+    tokens_cached = kwargs.get("tokens_cached") or 0
+    cents = cost_cents(spec, tokens_in, tokens_out, tokens_cached) if spec and kwargs.get("status") == "ok" else Decimal(0)
     factory = session_factory()
     with factory() as session:
         session.add(
@@ -1210,6 +1332,7 @@ def _record(**kwargs) -> None:
         TOKENS.labels(stage=stage, model=model, direction="in").inc(kwargs.get("tokens_in") or 0)
         TOKENS.labels(stage=stage, model=model, direction="out").inc(kwargs.get("tokens_out") or 0)
         COST.labels(stage=stage, model=model).inc(float(cents))
+    return cents
 
 
 def _add_progress(
@@ -1244,12 +1367,36 @@ def _add_progress(
     session.expire(job, ["done_segments", "tokens_in", "tokens_out", "cost_cents"])
 
 
-def _add_cost(session: Session, job: TranslationJob, model: str, tokens_in: int, tokens_out: int) -> None:
-    try:
-        spec = resolve_model(model)
-    except AppError:
-        return
-    _add_progress(session, job, cost=cost_cents(spec, tokens_in, tokens_out))
+def _add_cost(
+    session: Session,
+    job: TranslationJob,
+    model: str,
+    tokens_in: int,
+    tokens_out: int,
+    cents: Decimal | None = None,
+) -> None:
+    amount = cents
+    if amount is None:
+        recorded = session.execute(
+            text(
+                """
+                SELECT cost_cents FROM provider_calls
+                WHERE job_id = :job AND tokens_in = :tokens_in AND tokens_out = :tokens_out AND status = 'ok'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"job": job.id, "tokens_in": tokens_in, "tokens_out": tokens_out},
+        ).scalar()
+        if recorded is None:
+            try:
+                spec = resolve_model(model)
+            except AppError:
+                return
+            amount = cost_cents(spec, tokens_in, tokens_out, 0)
+        else:
+            amount = Decimal(recorded)
+    _add_progress(session, job, cost=amount)
 
 
 def _check_cap(session: Session, job: TranslationJob) -> None:
@@ -1334,13 +1481,14 @@ def _upsert_translation(session, job_id, block_idx, text, source, segment_id) ->
     session.execute(stmt)
 
 
-def _tm_get(session: Session, owner_id, src_hash: str, source: str, target: str) -> str | None:
+def _tm_get(session: Session, owner_id, src_hash: str, source: str, target: str, *, count_hit: bool = True) -> str | None:
     if owner_id is None:
         return None
     row = session.get(TranslationMemory, (owner_id, src_hash, source, target))
     if row is None:
         return None
-    row.hits = (row.hits or 0) + 1
+    if count_hit:
+        row.hits = (row.hits or 0) + 1
     return row.tgt_text
 
 
@@ -1432,6 +1580,16 @@ def debug_provider_calls(session: Session) -> dict:
         "max_inflight": gate.max_inflight,
         "effective_max": gate.effective_max,
     }
+
+
+def stored_estimates(session: Session, job_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal | None]:
+    if not job_ids:
+        return {}
+    rows = session.execute(
+        text("SELECT id, estimate_cents FROM translation_jobs WHERE id = ANY(:ids)"),
+        {"ids": list(job_ids)},
+    ).all()
+    return {row.id: row.estimate_cents for row in rows}
 
 
 def cost_for_job(session: Session, job_id: uuid.UUID) -> dict:

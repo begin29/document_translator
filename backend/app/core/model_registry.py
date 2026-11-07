@@ -27,6 +27,7 @@ class ModelSpec:
     image_token_multiplier: float = 1
     uses_max_completion_tokens: bool = True
     segment_cap_tokens: int | None = None
+    cached_input_price_per_1m: float | None = None
 
     def public(self) -> dict:
         data = asdict(self)
@@ -47,6 +48,7 @@ _DEFAULTS: list[ModelSpec] = [
         image_base_tokens=2833,
         image_tokens_per_tile=5667,
         image_token_multiplier=1,
+        cached_input_price_per_1m=0.075,
     ),
     ModelSpec(
         id="gpt-4o-2024-08-06",
@@ -61,6 +63,7 @@ _DEFAULTS: list[ModelSpec] = [
         image_base_tokens=85,
         image_tokens_per_tile=170,
         image_token_multiplier=1,
+        cached_input_price_per_1m=1.25,
     ),
 ]
 
@@ -125,11 +128,22 @@ def tier_allows_reuse(stored_model: str | None, requested: ModelSpec) -> bool:
     return TIER_RANK.get(stored.quality_tier, 0) >= TIER_RANK.get(requested.quality_tier, 0)
 
 
-def cost_cents(spec: ModelSpec, tokens_in: int, tokens_out: int) -> Decimal:
+def cached_input_price(spec: ModelSpec) -> float:
+    if spec.cached_input_price_per_1m is None:
+        return spec.input_price_per_1m / 2
+    return spec.cached_input_price_per_1m
+
+
+def cost_cents(spec: ModelSpec, tokens_in: int, tokens_out: int, tokens_cached: int = 0) -> Decimal:
+    incoming = max(int(tokens_in or 0), 0)
+    outgoing = max(int(tokens_out or 0), 0)
+    cached = min(max(int(tokens_cached or 0), 0), incoming)
+    uncached = incoming - cached
     dollars = (
-        Decimal(tokens_in) * Decimal(str(spec.input_price_per_1m)) / Decimal(1_000_000)
-        + Decimal(tokens_out) * Decimal(str(spec.output_price_per_1m)) / Decimal(1_000_000)
-    )
+        Decimal(uncached) * Decimal(str(spec.input_price_per_1m))
+        + Decimal(cached) * Decimal(str(cached_input_price(spec)))
+        + Decimal(outgoing) * Decimal(str(spec.output_price_per_1m))
+    ) / Decimal(1_000_000)
     return (dollars * Decimal(100)).quantize(Decimal("0.0001"))
 
 

@@ -13,7 +13,7 @@ from app.auth.deps import current_user, get_session, require_admin
 from app.config import get_settings
 from app.core.chunking import segment_budget
 from app.core.errors import AppError
-from app.core.languages import LANGUAGES
+from app.core.languages import LANGUAGES, known_language
 from app.core.model_registry import all_models
 from app.core.service import (
     cancel_job,
@@ -23,7 +23,10 @@ from app.core.service import (
     create_job,
     debug_provider_calls,
     edit_translation,
+    estimate_for,
+    public_estimate,
     render_job,
+    stored_estimates,
 )
 from app.db.models import Block, BlockTranslation, Document, JobEvent, ProviderCall, Segment, TranslationJob, User
 
@@ -69,6 +72,10 @@ def _document(document: Document) -> dict:
     }
 
 
+def _one_estimate(session: Session, job_id: uuid.UUID):
+    return stored_estimates(session, [job_id]).get(job_id)
+
+
 def _filename(session: Session, document_id: uuid.UUID) -> str | None:
     document = session.get(Document, document_id)
     if document is None:
@@ -76,7 +83,7 @@ def _filename(session: Session, document_id: uuid.UUID) -> str | None:
     return document.filename
 
 
-def _job(job: TranslationJob, filename: str | None = None) -> dict:
+def _job(job: TranslationJob, filename: str | None = None, estimate_cents=None) -> dict:
     return {
         "id": str(job.id),
         "document_id": str(job.document_id),
@@ -97,6 +104,7 @@ def _job(job: TranslationJob, filename: str | None = None) -> dict:
         "render_mode": job.render_mode,
         "quality_warning": job.quality_warning,
         "summary": job.summary,
+        "estimate_cents": None if estimate_cents is None else float(estimate_cents),
         "created_at": job.created_at.isoformat() if job.created_at else None,
     }
 
@@ -152,7 +160,26 @@ def post_job(
         idempotency_key,
         body.render_mode,
     )
-    return _job(job, _filename(session, job.document_id))
+    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
+
+
+@router.get("/documents/{document_id}/estimate")
+def document_estimate(
+    document_id: uuid.UUID,
+    target_lang: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    document = owned(session, Document, document_id, user)
+    if not known_language(target_lang):
+        raise AppError(
+            "unknown_language",
+            f"Target language '{target_lang}' is not supported.",
+            target_lang,
+            False,
+            400,
+        )
+    return {"models": [public_estimate(estimate_for(session, document, target_lang, spec.alias)) for spec in all_models()]}
 
 
 @router.get("/jobs")
@@ -164,20 +191,21 @@ def list_jobs(session: Session = Depends(get_session), user: User = Depends(curr
         .order_by(TranslationJob.created_at.desc())
         .limit(100)
     ).all()
-    return [_job(job, filename) for job, filename in rows]
+    estimates = stored_estimates(session, [job.id for job, _filename in rows])
+    return [_job(job, filename, estimates.get(job.id)) for job, filename in rows]
 
 
 @router.get("/jobs/{job_id}")
 def read_job(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     job = owned(session, TranslationJob, job_id, user)
-    return _job(job, _filename(session, job.document_id))
+    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
 
 
 @router.post("/jobs/{job_id}/cancel")
 def post_cancel(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     owned(session, TranslationJob, job_id, user)
     job = cancel_job(session, job_id)
-    return _job(job, _filename(session, job.document_id))
+    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
 
 
 @router.get("/jobs/{job_id}/segments")
@@ -237,7 +265,7 @@ def patch_segment(
 def post_render(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     owned(session, TranslationJob, job_id, user)
     job = render_job(session, job_id)
-    return _job(job, _filename(session, job.document_id))
+    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
 
 
 @router.get("/jobs/{job_id}/download")
