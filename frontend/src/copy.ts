@@ -18,6 +18,10 @@ export const ERROR_COPY: Record<string, string> = {
   unknown_model: "That model is not available.",
   unknown_language: "That target language is not supported.",
   cancelled: "This translation was cancelled.",
+  service_unavailable: "The translator is temporarily unavailable. Try again in a moment.",
+  invalid_response: "The server returned a response that could not be read.",
+  path_outside_workspace: "That file path is outside the workspace.",
+  not_found: "That document or translation could not be found.",
 };
 
 export function errorMessage(code: string | null | undefined, fallback?: string | null): string {

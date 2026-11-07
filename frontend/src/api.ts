@@ -1,12 +1,45 @@
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+export class ApiError extends Error {
+  code: string;
+  detail: string;
+  status: number;
+
+  constructor(code: string, message: string, detail: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.code = code;
+    this.detail = detail;
+    this.status = status;
+  }
+}
+
+function nonJsonError(response: Response): ApiError {
+  if (response.status === 413) {
+    return new ApiError("file_too_large", "This file is larger than the upload limit.", response.statusText, response.status);
+  }
+  if (response.status === 502 || response.status === 503 || response.status === 504) {
+    return new ApiError("service_unavailable", response.statusText || "Service unavailable", response.statusText, response.status);
+  }
+  return new ApiError(`http_${response.status}`, response.statusText || `HTTP ${response.status}`, response.statusText, response.status);
+}
+
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   const text = await response.text();
-  const body = text ? JSON.parse(text) : null;
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    if (!response.ok) throw nonJsonError(response);
+    throw new ApiError("invalid_response", "The server returned a response that could not be read.", response.statusText, response.status);
+  }
   if (!response.ok) {
-    const error = new Error(body?.message || response.statusText) as Error & { code?: string; detail?: string };
-    error.code = body?.code;
-    error.detail = body?.detail;
-    throw error;
+    const record = body && typeof body === "object" ? (body as { code?: string; message?: string; detail?: string }) : {};
+    throw new ApiError(
+      record.code || `http_${response.status}`,
+      record.message || response.statusText || `HTTP ${response.status}`,
+      record.detail || "",
+      response.status,
+    );
   }
   return body as T;
 }
@@ -37,11 +70,13 @@ export type DocumentRecord = {
   } | null;
   error_code: string | null;
   error_detail: string | null;
+  seq?: number;
 };
 
 export type JobRecord = {
   id: string;
   document_id: string;
+  document_filename: string | null;
   source_lang: string | null;
   target_lang: string;
   model: string;
@@ -54,6 +89,27 @@ export type JobRecord = {
   output_stale: boolean;
   quality_warning: boolean;
   render_mode: string;
+  created_at: string | null;
+  seq?: number;
+};
+
+export type JobMessage = {
+  type: "job";
+  id: string;
+  status: string;
+  done_segments: number;
+  total_segments: number;
+  cost_cents: number;
+  error_code: string | null;
+  seq: number;
+};
+
+export type DocumentMessage = {
+  type: "document";
+  id: string;
+  analysis_status: string;
+  error_code: string | null;
+  seq: number;
 };
 
 export type SegmentRecord = {
