@@ -9,7 +9,6 @@ EXPANSION: dict[tuple[str, str], float] = {
     ("en", "nl"): 1.20,
     ("en", "pl"): 1.20,
     ("en", "uk"): 1.15,
-    ("en", "ru"): 1.15,
     ("en", "ja"): 1.60,
     ("en", "zh"): 0.80,
     ("en", "ko"): 1.10,
@@ -32,13 +31,13 @@ LANGUAGES: list[dict[str, str]] = [
     {"code": "nl", "name": "Dutch"},
     {"code": "pl", "name": "Polish"},
     {"code": "uk", "name": "Ukrainian"},
-    {"code": "ru", "name": "Russian"},
     {"code": "ja", "name": "Japanese"},
     {"code": "zh", "name": "Chinese"},
     {"code": "ko", "name": "Korean"},
 ]
 
 _CODES = {item["code"] for item in LANGUAGES}
+_NAMES = {item["code"]: item["name"] for item in LANGUAGES} | {"ru": "Russian"}
 
 
 def expansion_ratio(source: str | None, target: str | None) -> float:
@@ -51,3 +50,13 @@ def expansion_ratio(source: str | None, target: str | None) -> float:
 
 def known_language(code: str | None) -> bool:
     return bool(code) and code.lower() in _CODES
+
+
+def language_name(code: str | None) -> str:
+    if code is None or code.lower() == "auto":
+        return "auto-detected"
+    key = code.lower()
+    name = _NAMES.get(key)
+    if name is None:
+        return code
+    return f"{name} ({key})"

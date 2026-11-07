@@ -8,8 +8,53 @@ _COMMON = {
     "de": {"und", "der", "die", "das", "ist", "nicht", "ein", "eine", "mit", "auf", "für", "den"},
     "fr": {"les", "des", "une", "est", "dans", "pour", "que", "pas", "sur", "avec", "par"},
     "es": {"los", "las", "una", "del", "que", "por", "con", "para", "como", "más"},
-    "uk": {"та", "не", "на", "що", "для", "від", "або", "як", "це", "але"},
-    "ru": {"и", "в", "не", "на", "что", "это", "как", "по", "из", "для"},
+    "uk": {
+        "та",
+        "і",
+        "й",
+        "не",
+        "на",
+        "що",
+        "для",
+        "від",
+        "або",
+        "як",
+        "це",
+        "але",
+        "з",
+        "у",
+        "до",
+        "ми",
+        "ви",
+        "він",
+        "вона",
+        "вони",
+        "був",
+        "була",
+        "було",
+        "буде",
+        "також",
+        "які",
+        "який",
+        "яка",
+    },
+    "ru": {
+        "и",
+        "что",
+        "это",
+        "как",
+        "из",
+        "он",
+        "она",
+        "они",
+        "был",
+        "была",
+        "было",
+        "будет",
+        "также",
+        "который",
+        "которая",
+    },
 }
 
 
@@ -30,10 +75,16 @@ def detect_language(text: str, *, fallback_en: bool = True) -> str | None:
         return "zh"
     tokens = re.findall(r"\w+", sample.lower(), flags=re.UNICODE)
     if cyr > max(12, letters * 0.4):
-        scores = {lang: sum(1 for t in tokens if t in words) for lang, words in _COMMON.items() if lang in {"uk", "ru"}}
-        if scores["uk"] == scores["ru"] == 0:
+        uk_letters = len(re.findall(r"[іїєґІЇЄҐ]", sample))
+        ru_letters = len(re.findall(r"[ыэъёЫЭЪЁ]", sample))
+        if uk_letters >= 2 and uk_letters > 2 * ru_letters:
+            return "uk"
+        if ru_letters >= 2 and ru_letters > 2 * uk_letters:
             return "ru"
-        return max(scores, key=scores.get)
+        scores = {lang: sum(1 for t in tokens if t in words) for lang, words in _COMMON.items() if lang in {"uk", "ru"}}
+        if scores["uk"] == scores["ru"]:
+            return None
+        return "uk" if scores["uk"] > scores["ru"] else "ru"
     scores = {lang: sum(1 for t in tokens if t in words) for lang, words in _COMMON.items() if lang not in {"uk", "ru"}}
     best = max(scores, key=scores.get)
     if scores[best] >= 2:
