@@ -100,6 +100,7 @@ def stack(_migrated, monkeypatch, tmp_path):
     api_url = f"http://127.0.0.1:{api_port}"
     realtime_url = f"http://127.0.0.1:{realtime_port}"
     monkeypatch.setenv("DATABASE_URL", test_db)
+    monkeypatch.setenv("AUTH_SECRET", "test-secret")
     monkeypatch.setenv("TRANSLATOR_API_URL", api_url)
     monkeypatch.setenv("REALTIME_URL", realtime_url)
     monkeypatch.setenv("REDIS_URL", "redis://fake:6379/0")
@@ -124,12 +125,22 @@ def stack(_migrated, monkeypatch, tmp_path):
     with factory() as db:
         db.execute(
             text(
-                "TRUNCATE documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
+                "TRUNCATE users, documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
             )
         )
         db.execute(text("UPDATE provider_gate SET inflight=0, max_inflight=0, effective_max=ceiling, window_tokens=0, last_429_at=NULL"))
         sync_gate(db)
+        from app.auth.passwords import hash_password
+        from app.auth.tokens import create_token
+        from app.db.models import User
+
+        account = User(email="mcp@example.com", password_hash=hash_password("password1234"))
+        db.add(account)
+        db.flush()
+        token = create_token(db, account, "mcp")
         db.commit()
+    monkeypatch.setenv("TRANSLATOR_API_TOKEN", token)
+    auth_headers = {"Authorization": f"Bearer {token}"}
     realtime_server, realtime_thread = _serve(realtime_app, realtime_port)
     api_server, api_thread = _serve(api_app, api_port)
     stop = threading.Event()
@@ -140,13 +151,18 @@ def stack(_migrated, monkeypatch, tmp_path):
         worker.start()
         warmup = tmp_path / "warmup.pdf"
         _pdf(warmup, ["Warmup paragraph so the worker imports its libraries before the ticker."])
-        uploaded = httpx.post(f"{api_url}/api/documents", files={"file": ("warmup.pdf", warmup.read_bytes())}, timeout=10)
+        uploaded = httpx.post(
+            f"{api_url}/api/documents",
+            files={"file": ("warmup.pdf", warmup.read_bytes())},
+            headers=auth_headers,
+            timeout=10,
+        )
         uploaded.raise_for_status()
         document_id = uploaded.json()["id"]
         deadline = time.monotonic() + 30
         status = None
         while time.monotonic() < deadline:
-            ready = httpx.get(f"{api_url}/api/documents/{document_id}", timeout=2)
+            ready = httpx.get(f"{api_url}/api/documents/{document_id}", headers=auth_headers, timeout=2)
             ready.raise_for_status()
             status = ready.json()["analysis_status"]
             if status in {"ready", "failed"}:

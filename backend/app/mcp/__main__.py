@@ -30,10 +30,48 @@ mcp = FastMCP(
 )
 
 
-def _client() -> ApiClient:
+_UNAUTHORIZED = "unauthorized: create a token in the web app under Settings → Tokens"
+
+
+def _bearer(header: str | None) -> str | None:
+    if not header:
+        return None
+    scheme, sep, value = header.strip().partition(" ")
+    if not sep or scheme.lower() != "bearer":
+        return None
+    token = value.strip()
+    return token or None
+
+
+def _http_request(ctx):
+    if ctx is None:
+        return None
+    holder = getattr(ctx, "_request_context", None)
+    if holder is None:
+        return None
+    return getattr(holder, "request", None)
+
+
+def _require_token(ctx) -> str:
+    request = _http_request(ctx)
+    if request is not None:
+        headers = getattr(request, "headers", None)
+        header = headers.get("authorization") if headers is not None else None
+        token = _bearer(header)
+        if not token:
+            raise ToolError(_UNAUTHORIZED)
+        return token
+    token = os.environ.get("TRANSLATOR_API_TOKEN", "").strip()
+    if not token:
+        raise ToolError(_UNAUTHORIZED)
+    return token
+
+
+def _client(ctx=None) -> ApiClient:
+    token = _require_token(ctx)
     base = os.environ.get("TRANSLATOR_API_URL", "").strip() or "http://127.0.0.1:8000"
     realtime = os.environ.get("REALTIME_URL", "").strip() or "http://127.0.0.1:8002"
-    return ApiClient(base, realtime)
+    return ApiClient(base, realtime, token=token)
 
 
 def _workspace() -> Path | None:
@@ -71,11 +109,16 @@ def _remember(job_id: str, source: Path) -> None:
 
 
 @mcp.tool()
-async def estimate_translation(path: str, target_language: str, source_language: str | None = None) -> dict:
+async def estimate_translation(
+    path: str,
+    target_language: str,
+    source_language: str | None = None,
+    ctx: Context | None = None,
+) -> dict:
     """Estimate tokens, segments, and price for a document before translating it."""
     try:
         source = _resolve(path)
-        async with _client() as api:
+        async with _client(ctx) as api:
             uploaded = await api.upload(str(source))
             document = await api.wait_document(uploaded["id"])
         analysis = document.get("analysis") or {}
@@ -96,13 +139,13 @@ async def translate_document(
     source_language: str | None = None,
     output_path: str | None = None,
     wait: bool = False,
-    ctx: Context = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Translate a PDF, DOCX, or photo. Returns a job id immediately unless wait is true."""
     try:
         source = _resolve(path)
         target = _resolve(output_path) if output_path else None
-        async with _client() as api:
+        async with _client(ctx) as api:
             uploaded = await api.upload(str(source))
             document = await api.wait_document(uploaded["id"])
             job = await api.create_job(document["id"], target_language, source_language)
@@ -128,20 +171,20 @@ async def translate_document(
 
 
 @mcp.tool()
-async def get_translation_status(job_id: str) -> dict:
+async def get_translation_status(job_id: str, ctx: Context | None = None) -> dict:
     """Read the status of a translation job."""
     try:
-        async with _client() as api:
+        async with _client(ctx) as api:
             return await api.get_job(job_id)
     except ApiError as exc:
         raise _fail(exc) from exc
 
 
 @mcp.tool()
-async def download_translation(job_id: str, output_path: str | None = None) -> dict:
+async def download_translation(job_id: str, output_path: str | None = None, ctx: Context | None = None) -> dict:
     """Download a finished translation. Writes next to the source when output_path is omitted."""
     try:
-        async with _client() as api:
+        async with _client(ctx) as api:
             if output_path:
                 target = _resolve(output_path)
             else:
@@ -161,6 +204,9 @@ async def download_translation(job_id: str, output_path: str | None = None) -> d
 
 
 def main() -> None:
+    from app.config import ensure_auth_secret
+
+    ensure_auth_secret()
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http").strip() or "streamable-http"
     if transport == "stdio":
         mcp.run(transport="stdio")

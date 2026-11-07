@@ -71,6 +71,7 @@ def _job_state(status="translating", done=1, total=4, cost=1):
         "total_segments": total,
         "cost_cents": cost,
         "error_code": None,
+        "owner_id": "user-1",
     }
 
 
@@ -81,9 +82,10 @@ def _clear_publish_state():
     events._sent.clear()
 
 
-def test_channels_for_names_phase1_channels():
-    assert events.channels_for({"type": "job", "id": "abc"}) == ["job:abc"]
-    assert events.channels_for({"type": "document", "id": "def"}) == ["document:def"]
+def test_channels_for_names_the_user_channel():
+    assert events.channels_for({"type": "job", "id": "abc", "owner_id": "u1"}) == ["user:u1"]
+    assert events.channels_for({"type": "document", "id": "def", "owner_id": "u1"}) == ["user:u1"]
+    assert events.channels_for({"type": "job", "id": "abc"}) == []
     assert events.channels_for({"type": "other", "id": "abc"}) == []
 
 
@@ -127,17 +129,17 @@ def test_throttle_drops_repeat_and_keeps_status_and_terminal(monkeypatch):
     clock["now"] += 0.5
     events.publish_job(_job_state(done=4))
     assert len(client.published) == 5
-    assert client.published[0][0] == "job:job-throttle"
+    assert client.published[0][0] == "user:user-1"
 
 
 def test_document_messages_are_not_throttled(monkeypatch):
     client = _patch_redis(monkeypatch)
-    state = {"id": "doc-1", "analysis_status": "running", "error_code": None}
+    state = {"id": "doc-1", "analysis_status": "running", "error_code": None, "owner_id": "user-1"}
     events.publish_document(state)
     events.publish_document(state)
-    events.publish_document({"id": "doc-1", "analysis_status": "ready", "error_code": None})
+    events.publish_document({"id": "doc-1", "analysis_status": "ready", "error_code": None, "owner_id": "user-1"})
     assert len(client.published) == 3
-    assert [channel for channel, _body in client.published] == ["document:doc-1"] * 3
+    assert [channel for channel, _body in client.published] == ["user:user-1"] * 3
     assert json.loads(client.published[-1][1])["analysis_status"] == "ready"
 
 
@@ -178,7 +180,7 @@ def session(_migrated):
     with factory() as db:
         db.execute(
             text(
-                "TRUNCATE documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
+                "TRUNCATE users, documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
             )
         )
         db.execute(text("UPDATE provider_gate SET inflight=0, max_inflight=0, effective_max=ceiling, window_tokens=0, last_429_at=NULL"))
@@ -189,9 +191,10 @@ def session(_migrated):
         yield db
 
 
-def _seed(session):
+def _seed(session, owner_id):
     document = Document(
         id=uuid.uuid4(),
+        owner_id=owner_id,
         filename="a.pdf",
         format="pdf",
         size_bytes=4,
@@ -203,6 +206,7 @@ def _seed(session):
     session.flush()
     job = TranslationJob(
         document_id=document.id,
+        owner_id=owner_id,
         source_lang="en",
         target_lang="de",
         model="gpt-4o-mini",
@@ -243,8 +247,8 @@ def _drain(db, limit=80):
 
 
 @needs_db
-def test_commit_publishes_once(session, monkeypatch):
-    _document, job = _seed(session)
+def test_commit_publishes_once(session, monkeypatch, make_user):
+    _document, job = _seed(session, make_user().id)
     session.commit()
     client = _patch_redis(monkeypatch)
     _add_progress(session, job, segments=2, cost=Decimal("1.25"))
@@ -253,7 +257,8 @@ def test_commit_publishes_once(session, monkeypatch):
     channel, raw = client.published[0]
     message = json.loads(raw)
     session.refresh(job)
-    assert channel == f"job:{job.id}"
+    assert channel == f"user:{job.owner_id}"
+    assert message["owner_id"] == str(job.owner_id)
     assert message["type"] == "job"
     assert message["id"] == str(job.id)
     assert message["status"] == job.status
@@ -265,8 +270,8 @@ def test_commit_publishes_once(session, monkeypatch):
 
 
 @needs_db
-def test_rollback_publishes_nothing(session, monkeypatch):
-    _document, job = _seed(session)
+def test_rollback_publishes_nothing(session, monkeypatch, make_user):
+    _document, job = _seed(session, make_user().id)
     session.commit()
     client = _patch_redis(monkeypatch)
     _add_progress(session, job, segments=1)
@@ -279,8 +284,8 @@ def test_rollback_publishes_nothing(session, monkeypatch):
 
 
 @needs_db
-def test_raising_client_does_not_fail_progress(session, monkeypatch):
-    _document, job = _seed(session)
+def test_raising_client_does_not_fail_progress(session, monkeypatch, make_user):
+    _document, job = _seed(session, make_user().id)
     session.commit()
     _patch_redis(monkeypatch, RaisingRedis())
     with capture_logs() as captured:
@@ -292,11 +297,12 @@ def test_raising_client_does_not_fail_progress(session, monkeypatch):
 
 
 @needs_db
-def test_full_job_publishes_done_matching_db(session, monkeypatch, tmp_path):
+def test_full_job_publishes_done_matching_db(session, monkeypatch, tmp_path, make_user):
+    owner = make_user()
     client = _patch_redis(monkeypatch)
     path = tmp_path / "short.pdf"
     _pdf(path, ["The motor housing is sealed against dust and water during every ride."])
-    document = create_document(session, "short.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "short.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -307,12 +313,17 @@ def test_full_job_publishes_done_matching_db(session, monkeypatch, tmp_path):
     _drain(session)
     session.refresh(job)
     assert job.status == "done"
-    documents = [json.loads(body) for channel, body in client.published if channel == f"document:{document.id}"]
+    owner_channel = f"user:{document.owner_id}"
+    documents = [
+        json.loads(body)
+        for channel, body in client.published
+        if channel == owner_channel and json.loads(body)["type"] == "document" and json.loads(body)["id"] == str(document.id)
+    ]
     assert any(item["analysis_status"] == "ready" and item["error_code"] is None for item in documents)
     done = [
         json.loads(body)
         for channel, body in client.published
-        if channel == f"job:{job.id}" and json.loads(body)["status"] == "done"
+        if channel == owner_channel and json.loads(body)["type"] == "job" and json.loads(body)["id"] == str(job.id) and json.loads(body)["status"] == "done"
     ]
     assert len(done) == 1
     assert done[0]["done_segments"] == job.done_segments

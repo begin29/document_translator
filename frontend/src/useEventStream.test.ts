@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobMessage } from "./api";
-import { eventsUrl, mergeState, openEventStream } from "./useEventStream";
+import { mergeState, openEventStream, stopEventStream } from "./useEventStream";
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 2;
   url: string;
+  readyState = FakeEventSource.OPEN;
   closed = false;
   onerror: (() => void) | null = null;
   private listeners = new Map<string, ((event: MessageEvent) => void)[]>();
@@ -25,10 +29,12 @@ class FakeEventSource {
   }
 
   fail() {
+    this.readyState = FakeEventSource.CLOSED;
     this.onerror?.();
   }
 
   close() {
+    this.readyState = FakeEventSource.CLOSED;
     this.closed = true;
   }
 }
@@ -44,16 +50,28 @@ const job = (seq: number, status: string): JobMessage => ({
   seq,
 });
 
+function mockTicket(tickets: string[]) {
+  let index = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      const ticket = tickets[Math.min(index, tickets.length - 1)];
+      index += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => JSON.stringify({ ticket, expires_at: "2026-01-01T00:00:00Z" }),
+      };
+    }),
+  );
+}
+
 afterEach(() => {
+  stopEventStream();
   FakeEventSource.instances = [];
   vi.unstubAllGlobals();
   vi.useRealTimers();
-});
-
-describe("eventsUrl", () => {
-  it("sorts job and document ids", () => {
-    expect(eventsUrl({ jobs: ["b", "a"], documents: ["d", "c"] })).toBe("/events?job=a&job=b&document=c&document=d");
-  });
 });
 
 describe("mergeState", () => {
@@ -74,13 +92,15 @@ describe("mergeState", () => {
 });
 
 describe("openEventStream", () => {
-  it("calls fetchState on subscribed and resync", () => {
+  it("opens one ticket stream and refetches on subscribed and resync", async () => {
     vi.stubGlobal("EventSource", FakeEventSource);
+    mockTicket(["a b"]);
     const fetchState = vi.fn();
-    const session = openEventStream({ jobs: ["b", "a"], documents: [] }, { fetchState, onMessage: () => undefined });
+    const session = openEventStream({ fetchState, onMessage: () => undefined });
     try {
+      await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
       const source = FakeEventSource.instances[0];
-      expect(source.url).toBe("/events?job=a&job=b");
+      expect(source.url).toBe("/events?ticket=a%20b");
       source.emit("subscribed");
       source.emit("resync");
       expect(fetchState).toHaveBeenCalledTimes(2);
@@ -89,32 +109,35 @@ describe("openEventStream", () => {
     }
   });
 
-  it("switches to polling after three errors", () => {
-    vi.useFakeTimers();
+  it("shares one connection across listeners", async () => {
     vi.stubGlobal("EventSource", FakeEventSource);
-    const fetchState = vi.fn();
-    const session = openEventStream({ jobs: ["job-1"], documents: [] }, { fetchState, onMessage: () => undefined });
+    mockTicket(["shared"]);
+    const first = openEventStream({ fetchState: () => undefined, onMessage: () => undefined });
+    const second = openEventStream({ fetchState: () => undefined, onMessage: () => undefined });
     try {
-      const source = FakeEventSource.instances[0];
-      source.fail();
-      source.fail();
-      expect(session.mode).toBe("stream");
-      source.fail();
-      expect(session.mode).toBe("polling");
-      expect(source.closed).toBe(true);
-      expect(fetchState).toHaveBeenCalledTimes(1);
-      vi.advanceTimersByTime(5000);
-      expect(fetchState).toHaveBeenCalledTimes(2);
+      await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    } finally {
+      first.close();
+      second.close();
+    }
+    expect(FakeEventSource.instances[0].closed).toBe(true);
+  });
+
+  it("gets a new ticket after the stream closes", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    mockTicket(["first", "second"]);
+    const fetchState = vi.fn();
+    const session = openEventStream({ fetchState, onMessage: () => undefined });
+    try {
+      await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      vi.useFakeTimers();
+      FakeEventSource.instances[0].fail();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(FakeEventSource.instances[1].url).toBe("/events?ticket=second");
+      expect(FakeEventSource.instances[0].closed).toBe(true);
     } finally {
       session.close();
     }
-  });
-
-  it("opens no connection for an empty id set", () => {
-    vi.stubGlobal("EventSource", FakeEventSource);
-    const session = openEventStream({ jobs: [], documents: [] }, { fetchState: () => undefined, onMessage: () => undefined });
-    expect(FakeEventSource.instances).toHaveLength(0);
-    expect(session.mode).toBe("stream");
-    session.close();
   });
 });

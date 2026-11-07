@@ -40,10 +40,22 @@ class Settings(BaseSettings):
     worker_id: str = ""
     global_quality_cap: int = 2000
     prompt_overhead_tokens: int = 800
+    auth_secret: str = ""
+    allow_signup: bool = True
+    cookie_secure: bool = False
+    public_origin: str = "http://localhost:8080"
+    session_days: int = 30
 
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+
+def ensure_auth_secret() -> None:
+    settings = get_settings()
+    if settings.auth_secret.strip() or settings.provider == "fake":
+        return
+    raise RuntimeError("AUTH_SECRET is required when PROVIDER is not fake")
 
 
 @lru_cache

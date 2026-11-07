@@ -70,7 +70,7 @@ def reset_runtime() -> None:
             delattr(fn, "instance")
 
 
-def create_document(session: Session, filename: str, data: bytes) -> Document:
+def create_document(session: Session, data: bytes, filename: str, owner_id: uuid.UUID) -> Document:
     settings = get_settings()
     if len(data) > settings.max_upload_bytes:
         raise AppError(
@@ -82,7 +82,11 @@ def create_document(session: Session, filename: str, data: bytes) -> Document:
         )
     fmt = detect_format(data, filename)
     digest = hashlib.sha256(data).hexdigest()
-    existing = session.scalar(select(Document).where(Document.sha256 == digest).order_by(Document.created_at.desc()))
+    existing = session.scalar(
+        select(Document)
+        .where(Document.owner_id == owner_id, Document.sha256 == digest)
+        .order_by(Document.created_at.desc())
+    )
     if existing and existing.analysis_status in {"queued", "running", "ready", "failed"}:
         return existing
     document_id = uuid.uuid4()
@@ -97,6 +101,7 @@ def create_document(session: Session, filename: str, data: bytes) -> Document:
         raise AppError("invalid_file", "The file name tried to escape the upload directory.", filename, False, 400)
     document = Document(
         id=document_id,
+        owner_id=owner_id,
         filename=sanitized_filename(filename),
         format=fmt,
         size_bytes=len(data),
@@ -299,15 +304,18 @@ def create_job(
     idempotency_key: str | None,
     render_mode: str = "reflow",
 ) -> TranslationJob:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise AppError("not_found", "Document not found.", str(document_id), False, 404)
     if idempotency_key:
-        existing = session.scalar(select(TranslationJob).where(TranslationJob.idempotency_key == idempotency_key))
+        owner_match = TranslationJob.owner_id.is_(None) if document.owner_id is None else TranslationJob.owner_id == document.owner_id
+        existing = session.scalar(
+            select(TranslationJob).where(TranslationJob.idempotency_key == idempotency_key, owner_match)
+        )
         if existing:
             return existing
     if not known_language(target_lang):
         raise AppError("unknown_language", f"Target language '{target_lang}' is not supported.", target_lang, False, 400)
-    document = session.get(Document, document_id)
-    if document is None:
-        raise AppError("not_found", "Document not found.", str(document_id), False, 404)
     if document.analysis_status == "failed":
         raise AppError(
             document.error_code or "analysis_failed",
@@ -324,6 +332,7 @@ def create_job(
         raise AppError("invalid_render_mode", "Render mode must be reflow or layout.", render_mode, False, 400)
     job = TranslationJob(
         document_id=document.id,
+        owner_id=document.owner_id,
         source_lang=source,
         target_lang=target_lang.lower(),
         model=spec.alias,
@@ -696,7 +705,7 @@ def _build_segments(session: Session, job: TranslationJob) -> None:
         for block in chunk.blocks:
             if not block.text:
                 continue
-            hit = _tm_get(session, block.src_hash, source_lang, job.target_lang)
+            hit = _tm_get(session, job.owner_id, block.src_hash, source_lang, job.target_lang)
             if hit is None:
                 continue
             _upsert_translation(session, job.id, block.idx, hit, "tm", None)
@@ -872,7 +881,7 @@ def _translate_segment(session: Session, segment_id: uuid.UUID, worker_id: str) 
         by_hash[row.src_hash] = (translated, remembered)
         _upsert_translation(session, job.id, row.idx, translated, "model", segment.id)
         if remembered:
-            _tm_put(session, row.src_hash, job.source_lang or "en", job.target_lang, translated, spec.alias)
+            _tm_put(session, job.owner_id, row.src_hash, job.source_lang or "en", job.target_lang, translated, spec.alias)
     for row in rows:
         if row.src_hash in by_hash and session.get(BlockTranslation, (job.id, row.idx)) is None:
             translated, _remembered = by_hash[row.src_hash]
@@ -1224,7 +1233,7 @@ def _add_progress(
                 tokens_out = COALESCE(tokens_out, 0) + :tokens_out,
                 cost_cents = COALESCE(cost_cents, 0) + :cost
             WHERE id = :id
-            RETURNING id, status, done_segments, total_segments, cost_cents, error_code
+            RETURNING id, status, done_segments, total_segments, cost_cents, error_code, owner_id
             """
         ),
         {"segments": segments, "tokens_in": tokens_in, "tokens_out": tokens_out, "cost": cents, "id": job.id},
@@ -1259,6 +1268,7 @@ def _publish_job(session: Session, job: TranslationJob) -> None:
         "total_segments": job.total_segments or 0,
         "cost_cents": job.cost_cents or 0,
         "error_code": job.error_code,
+        "owner_id": job.owner_id,
     }
     after_commit(session, lambda state=state: publish_job(state))
 
@@ -1268,6 +1278,7 @@ def _publish_document(session: Session, document: Document) -> None:
         "id": document.id,
         "analysis_status": document.analysis_status,
         "error_code": document.error_code,
+        "owner_id": document.owner_id,
     }
     after_commit(session, lambda state=state: publish_document(state))
 
@@ -1323,20 +1334,30 @@ def _upsert_translation(session, job_id, block_idx, text, source, segment_id) ->
     session.execute(stmt)
 
 
-def _tm_get(session: Session, src_hash: str, source: str, target: str) -> str | None:
-    row = session.get(TranslationMemory, (src_hash, source, target))
+def _tm_get(session: Session, owner_id, src_hash: str, source: str, target: str) -> str | None:
+    if owner_id is None:
+        return None
+    row = session.get(TranslationMemory, (owner_id, src_hash, source, target))
     if row is None:
         return None
     row.hits = (row.hits or 0) + 1
     return row.tgt_text
 
 
-def _tm_put(session, src_hash, source, target, text, model) -> None:
+def _tm_put(session, owner_id, src_hash, source, target, text, model) -> None:
+    if owner_id is None:
+        return
     stmt = pg_insert(TranslationMemory).values(
-        src_hash=src_hash, source_lang=source, target_lang=target, tgt_text=text, model=model, hits=1
+        owner_id=owner_id,
+        src_hash=src_hash,
+        source_lang=source,
+        target_lang=target,
+        tgt_text=text,
+        model=model,
+        hits=1,
     )
     stmt = stmt.on_conflict_do_update(
-        index_elements=["src_hash", "source_lang", "target_lang"],
+        index_elements=["owner_id", "src_hash", "source_lang", "target_lang"],
         set_={"hits": TranslationMemory.hits + 1},
     )
     session.execute(stmt)
@@ -1355,7 +1376,7 @@ def _copy_duplicate_hashes(session, job, rows) -> None:
     for row in rows:
         if not row.text or session.get(BlockTranslation, (job.id, row.idx)):
             continue
-        hit = _tm_get(session, row.src_hash, job.source_lang or "en", job.target_lang)
+        hit = _tm_get(session, job.owner_id, row.src_hash, job.source_lang or "en", job.target_lang)
         if hit:
             _upsert_translation(session, job.id, row.idx, hit, "tm", None)
 
@@ -1444,7 +1465,7 @@ def cost_for_job(session: Session, job_id: uuid.UUID) -> dict:
     }
 
 
-def cost_stats(session: Session, since_hours: int = 24) -> list[dict]:
+def cost_stats(session: Session, owner_id: uuid.UUID, since_hours: int = 24) -> list[dict]:
     rows = session.execute(
         text(
             """
@@ -1455,11 +1476,12 @@ def cost_stats(session: Session, since_hours: int = 24) -> list[dict]:
                    count(*) AS calls
             FROM provider_calls
             WHERE created_at > now() - make_interval(hours => :hours)
+              AND job_id IN (SELECT id FROM translation_jobs WHERE owner_id = :owner)
             GROUP BY stage, model, prompt_version
             ORDER BY cost_cents DESC
             """
         ),
-        {"hours": since_hours},
+        {"hours": since_hours, "owner": owner_id},
     ).mappings()
     result = []
     for row in rows:

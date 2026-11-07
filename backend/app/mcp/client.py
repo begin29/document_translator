@@ -192,9 +192,20 @@ class ApiClient:
             yield await self._read(kind, ident)
             await anyio.sleep(_POLL_SECONDS)
 
+    async def _ticket(self) -> str:
+        assert self._http is not None
+        response = await self._http.post("/api/events/ticket")
+        self._check(response)
+        body = response.json()
+        ticket = body.get("ticket") if isinstance(body, dict) else None
+        if not ticket:
+            raise ApiError("unauthorized", "Sign in to continue.", False)
+        return str(ticket)
+
     async def _watch_connected(self, kind: str, ident: str) -> AsyncIterator[dict]:
         assert self._realtime is not None
-        async with self._realtime.stream("GET", "/events", params={kind: ident}) as response:
+        ticket = await self._ticket()
+        async with self._realtime.stream("GET", "/events", params={"ticket": ticket}) as response:
             if response.status_code >= 400:
                 raw = await response.aread()
                 self._check(response, raw.decode(errors="replace"))
@@ -265,6 +276,8 @@ class ApiClient:
                             try:
                                 message = json.loads(payload)
                             except json.JSONDecodeError:
+                                continue
+                            if not isinstance(message, dict) or str(message.get("id") or "") != ident:
                                 continue
                             state, current_seq, applied = _apply(kind, state, current_seq, message)
                             if applied and state is not None:

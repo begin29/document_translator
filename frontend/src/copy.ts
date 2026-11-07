@@ -22,6 +22,14 @@ export const ERROR_COPY: Record<string, string> = {
   invalid_response: "The server returned a response that could not be read.",
   path_outside_workspace: "That file path is outside the workspace.",
   not_found: "That document or translation could not be found.",
+  unauthorized: "Sign in to continue.",
+  csrf_failed: "The request was rejected. Refresh the page and try again.",
+  too_many_attempts: "Too many attempts. Wait a few minutes and try again.",
+  signup_disabled: "Sign up is disabled.",
+  email_taken: "An account with that email already exists.",
+  invalid_credentials: "The email or password is incorrect.",
+  weak_password: "Password must be at least 10 characters.",
+  invalid_email: "Enter a valid email address.",
 };
 
 export function errorMessage(code: string | null | undefined, fallback?: string | null): string {

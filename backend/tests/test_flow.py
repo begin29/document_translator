@@ -51,7 +51,7 @@ def session(_migrated):
     with factory() as db:
         db.execute(
             text(
-                "TRUNCATE documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
+                "TRUNCATE users, documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
             )
         )
         db.execute(text("UPDATE provider_gate SET inflight=0, max_inflight=0, effective_max=ceiling, window_tokens=0, last_429_at=NULL"))
@@ -78,10 +78,11 @@ def _drain(db, limit=80):
             return
 
 
-def test_lifecycle_and_idempotency(session, tmp_path):
+def test_lifecycle_and_idempotency(session, tmp_path, make_user):
+    owner = make_user()
     path = tmp_path / "short.pdf"
     _pdf(path, ["The motor housing is sealed against dust and water during every ride."])
-    document = create_document(session, "short.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "short.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -102,21 +103,23 @@ def test_lifecycle_and_idempotency(session, tmp_path):
 
 
 def test_corrupt_and_unsupported(session):
+    owner = uuid.uuid4()
     with pytest.raises(AppError) as exc:
-        create_document(session, "empty.pdf", b"")
+        create_document(session, b"", "empty.pdf", owner)
     assert exc.value.code == "invalid_file"
     with pytest.raises(AppError) as renamed:
-        create_document(session, "photo.pdf", b"\x89PNG\r\n\x1a\nrest")
+        create_document(session, b"\x89PNG\r\n\x1a\nrest", "photo.pdf", owner)
     assert renamed.value.code == "invalid_file"
     with pytest.raises(AppError) as exe:
-        create_document(session, "app.exe", b"MZ\x00\x00")
+        create_document(session, b"MZ\x00\x00", "app.exe", owner)
     assert exe.value.code == "unsupported_type"
 
 
-def test_cancel(session, tmp_path):
+def test_cancel(session, tmp_path, make_user):
+    owner = make_user()
     path = tmp_path / "c.pdf"
     _pdf(path, ["Cancel this document before the worker starts translating it today."])
-    document = create_document(session, "c.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "c.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -129,13 +132,14 @@ def test_cancel(session, tmp_path):
     assert job.status == "cancelled"
 
 
-def test_retry_does_not_double_bill(session, tmp_path, monkeypatch):
+def test_retry_does_not_double_bill(session, tmp_path, monkeypatch, make_user):
     monkeypatch.setenv("FAKE_FAIL_MODE", "http500")
     monkeypatch.setenv("FAKE_FAIL_SEGMENTS", "0")
     get_settings.cache_clear()
+    owner = make_user()
     path = tmp_path / "retry.pdf"
     _pdf(path, ["Retry the first segment and then succeed without billing it twice at all."])
-    document = create_document(session, "retry.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "retry.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -150,14 +154,15 @@ def test_retry_does_not_double_bill(session, tmp_path, monkeypatch):
     assert failed >= 1
 
 
-def test_crash_resume_skips_done_segments(session, tmp_path, monkeypatch):
+def test_crash_resume_skips_done_segments(session, tmp_path, monkeypatch, make_user):
     monkeypatch.setenv("CRASH_AFTER_SEGMENT", "1")
     monkeypatch.setenv("GLOBAL_QUALITY_CAP", "32")
     get_settings.cache_clear()
+    owner = make_user()
     path = tmp_path / "long.pdf"
     words = " ".join(["alpha"] * 40)
     _pdf(path, [f"{words} {i}." for i in range(4)])
-    document = create_document(session, "long.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "long.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -181,12 +186,13 @@ def test_debug_inflight_shape(session):
     assert "calls" in payload and "max_inflight" in payload
 
 
-def test_cost_endpoint_matches_rows(session, tmp_path):
+def test_cost_endpoint_matches_rows(session, tmp_path, make_user):
     from app.core.service import cost_for_job
 
+    owner = make_user()
     path = tmp_path / "cost.pdf"
     _pdf(path, ["Cost accounting must match the provider call ledger exactly here."])
-    document = create_document(session, "cost.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "cost.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -199,14 +205,15 @@ def test_cost_endpoint_matches_rows(session, tmp_path):
     assert session.get(TranslationJob, job.id).status == "done"
 
 
-def test_reaper_requeues_stale_segment(session, tmp_path):
+def test_reaper_requeues_stale_segment(session, tmp_path, make_user):
     from datetime import datetime, timedelta, timezone
 
     from app.db.models import Segment
 
+    owner = make_user()
     path = tmp_path / "reap.pdf"
     _pdf(path, ["Reaper should return a stale running segment to the pending queue."])
-    document = create_document(session, "reap.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "reap.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -226,14 +233,15 @@ def test_reaper_requeues_stale_segment(session, tmp_path):
     assert segment.status == "pending"
 
 
-def test_reaper_recovers_review_render_and_ocr(session, tmp_path):
+def test_reaper_recovers_review_render_and_ocr(session, tmp_path, make_user):
     from datetime import datetime, timedelta, timezone
 
     from app.db.models import OcrPage
 
+    owner = make_user()
     path = tmp_path / "reap-stages.pdf"
     _pdf(path, ["Reaper should release a review, a render lock, and a finished OCR job."])
-    document = create_document(session, "reap-stages.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "reap-stages.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -272,14 +280,10 @@ def test_reaper_recovers_review_render_and_ocr(session, tmp_path):
     assert job.status != "ocr"
 
 
-def test_api_and_mcp_estimate(session, tmp_path):
-    from fastapi.testclient import TestClient
-
-    from app.main import app
-
+def test_api_and_mcp_estimate(session, tmp_path, auth_client):
     path = tmp_path / "api.pdf"
     _pdf(path, ["The API accepts a PDF and the MCP estimate reads the same analysis."])
-    client = TestClient(app)
+    client = auth_client()
     uploaded = client.post("/api/documents", files={"file": ("api.pdf", path.read_bytes(), "application/pdf")})
     assert uploaded.status_code == 200
     document_id = uploaded.json()["id"]

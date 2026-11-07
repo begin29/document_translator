@@ -4,8 +4,11 @@ import os
 
 import uvicorn
 
+from app.config import ensure_auth_secret
+
 
 def main() -> None:
+    ensure_auth_secret()
     uvicorn.run(
         "app.realtime.app:app",
         host="0.0.0.0",

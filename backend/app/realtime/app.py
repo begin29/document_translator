@@ -5,7 +5,6 @@ import contextlib
 import json
 import os
 import random
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -15,6 +14,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from app.auth.tickets import verify as verify_ticket
+from app.config import ensure_auth_secret
+
 REALTIME_CONNECTIONS = Gauge("realtime_connections", "Open SSE connections")
 REALTIME_CHANNELS = Gauge("realtime_channels", "Redis channels with local listeners")
 REALTIME_MESSAGES = Counter("realtime_messages_total", "Messages received from Redis")
@@ -23,32 +25,48 @@ _POLL_SECONDS = 0.2
 _BACKOFF_START = 0.5
 _BACKOFF_MAX = 10.0
 _PING = object()
+_MAX_CONNECTIONS = 10
+_uid_connections: dict[str, int] = {}
+_uid_lock: asyncio.Lock | None = None
 
 
-class SubscriptionError(Exception):
-    def __init__(self, detail: str) -> None:
-        super().__init__(detail)
-        self.detail = detail
+def _lock() -> asyncio.Lock:
+    global _uid_lock
+    if _uid_lock is None:
+        _uid_lock = asyncio.Lock()
+    return _uid_lock
 
 
-def parse_subscriptions(request: Request) -> list[str]:
-    jobs = request.query_params.getlist("job")
-    documents = request.query_params.getlist("document")
-    if not 1 <= len(jobs) + len(documents) <= 50:
-        raise SubscriptionError("Provide between 1 and 50 job or document ids.")
-    channels: list[str] = []
-    seen: set[str] = set()
-    for kind, values in (("job", jobs), ("document", documents)):
-        for value in values:
-            try:
-                parsed = uuid.UUID(value)
-            except (ValueError, AttributeError, TypeError) as exc:
-                raise SubscriptionError("Job and document ids must be UUIDs.") from exc
-            channel = f"{kind}:{parsed}"
-            if channel not in seen:
-                seen.add(channel)
-                channels.append(channel)
-    return channels
+async def _acquire(uid: str) -> bool:
+    async with _lock():
+        count = _uid_connections.get(uid, 0)
+        if count >= _MAX_CONNECTIONS:
+            return False
+        _uid_connections[uid] = count + 1
+        return True
+
+
+async def _release(uid: str) -> None:
+    async with _lock():
+        count = _uid_connections.get(uid, 0) - 1
+        if count <= 0:
+            _uid_connections.pop(uid, None)
+        else:
+            _uid_connections[uid] = count
+
+
+def _unauthorized():
+    return JSONResponse(
+        {"code": "unauthorized", "message": "Sign in to continue.", "detail": "", "retryable": False},
+        status_code=401,
+    )
+
+
+def _too_many():
+    return JSONResponse(
+        {"code": "too_many_attempts", "message": "Too many live connections.", "detail": "", "retryable": True},
+        status_code=429,
+    )
 
 
 def _decode(value):
@@ -296,35 +314,40 @@ async def _next_item(queue: asyncio.Queue, request: Request):
                 await getter
 
 
-def _event_stream(request: Request, channels: list[str]):
+def _event_stream(request: Request, channels: list[str], uid: str):
     hub: Hub = request.app.state.hub
 
     async def stream():
-        async with hub.listen(channels) as queue:
-            yield f"retry: {random.randint(3000, 8000)}\n\n"
-            yield "event: subscribed\ndata: {}\n\n"
-            while True:
-                item = await _next_item(queue, request)
-                if item is None:
-                    return
-                if item is _PING:
-                    yield ": ping\n\n"
-                    continue
-                if isinstance(item, dict) and item.get("type") == "resync":
-                    yield "event: resync\ndata: {}\n\n"
-                    continue
-                yield "event: update\ndata: " + json.dumps(item, separators=(",", ":")) + "\n\n"
+        try:
+            async with hub.listen(channels) as queue:
+                yield f"retry: {random.randint(3000, 8000)}\n\n"
+                yield "event: subscribed\ndata: {}\n\n"
+                while True:
+                    item = await _next_item(queue, request)
+                    if item is None:
+                        return
+                    if item is _PING:
+                        yield ": ping\n\n"
+                        continue
+                    if isinstance(item, dict) and item.get("type") == "resync":
+                        yield "event: resync\ndata: {}\n\n"
+                        continue
+                    yield "event: update\ndata: " + json.dumps(item, separators=(",", ":")) + "\n\n"
+        finally:
+            await _release(uid)
 
     return stream()
 
 
 async def events(request: Request):
-    try:
-        channels = parse_subscriptions(request)
-    except SubscriptionError as exc:
-        return JSONResponse({"detail": exc.detail}, status_code=400)
+    uid = verify_ticket(request.query_params.get("ticket"))
+    if uid is None:
+        return _unauthorized()
+    key = str(uid)
+    if not await _acquire(key):
+        return _too_many()
     return StreamingResponse(
-        _event_stream(request, channels),
+        _event_stream(request, [f"user:{key}"], key),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -352,6 +375,7 @@ async def metrics(request: Request):
 
 @asynccontextmanager
 async def lifespan(app: Starlette):
+    ensure_auth_secret()
     hub = Hub(os.environ.get("REDIS_URL", ""))
     app.state.hub = hub
     await hub.start()

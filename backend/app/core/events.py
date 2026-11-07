@@ -13,8 +13,6 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.observability.logging import get_logger
 
-log = get_logger()
-
 _client = None
 _client_key: tuple[str, bool] | None = None
 _sent: dict[str, tuple[float, str]] = {}
@@ -42,11 +40,10 @@ def _redis():
 
 
 def channels_for(message: dict) -> list[str]:
-    kind = message.get("type")
-    ident = message.get("id")
-    if kind in {"job", "document"} and ident:
-        return [f"{kind}:{ident}"]
-    return []
+    owner = message.get("owner_id")
+    if not owner:
+        return []
+    return [f"user:{owner}"]
 
 
 def _now() -> float:
@@ -104,6 +101,7 @@ def publish_job(state: dict) -> None:
         "total_segments": _int(state.get("total_segments")),
         "cost_cents": _float(state.get("cost_cents")),
         "error_code": _optional_text(state.get("error_code")),
+        "owner_id": _optional_text(state.get("owner_id")),
         "seq": time.time_ns() // 1_000_000,
     }
     _emit(message, job_id=message["id"], status=status or "")
@@ -115,6 +113,7 @@ def publish_document(state: dict) -> None:
         "id": _text(state.get("id")),
         "analysis_status": _optional_text(state.get("analysis_status")),
         "error_code": _optional_text(state.get("error_code")),
+        "owner_id": _optional_text(state.get("owner_id")),
         "seq": time.time_ns() // 1_000_000,
     }
     _emit(message, job_id=None, status="")
@@ -130,6 +129,9 @@ def _spublish(client, channel: str, payload: str) -> None:
 
 def _emit(message: dict, *, job_id: str | None, status: str) -> None:
     try:
+        channels = channels_for(message)
+        if not channels:
+            return
         client = _redis()
         if client is None:
             return
@@ -137,13 +139,13 @@ def _emit(message: dict, *, job_id: str | None, status: str) -> None:
             return
         payload = json.dumps(message, separators=(",", ":"))
         cluster = get_settings().redis_cluster
-        for channel in channels_for(message):
+        for channel in channels:
             if cluster:
                 _spublish(client, channel, payload)
             else:
                 client.publish(channel, payload)
     except Exception as exc:
-        log.warning("event_publish_failed", error=type(exc).__name__)
+        get_logger().warning("event_publish_failed", error=type(exc).__name__)
 
 
 def after_commit(session: Session, fn: Callable[[], None]) -> None:

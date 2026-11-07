@@ -99,7 +99,7 @@ def session(_migrated):
     with factory() as db:
         db.execute(
             text(
-                "TRUNCATE documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
+                "TRUNCATE users, documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
             )
         )
         db.execute(text("UPDATE provider_gate SET inflight=0, max_inflight=0, effective_max=ceiling, window_tokens=0, last_429_at=NULL"))
@@ -121,11 +121,12 @@ def _drain(db, limit=80):
 
 
 @pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL is not set")
-def test_fake_uk_job_reaches_done_and_stores_source(session, tmp_path):
+def test_fake_uk_job_reaches_done_and_stores_source(session, tmp_path, make_user):
+    owner = make_user()
     paragraph = "The motor housing is sealed against dust and water during every ride."
     path = tmp_path / "uk.pdf"
     _pdf(path, [paragraph])
-    document = create_document(session, "uk.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), "uk.pdf", owner.id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()

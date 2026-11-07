@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { DocumentMessage, JobMessage } from "./api";
+import { DocumentMessage, JobMessage, request } from "./api";
 
 const JOB_TERMINAL = new Set(["done", "failed", "cancelled"]);
 const DOCUMENT_TERMINAL = new Set(["ready", "failed"]);
 const STALE_MS = 30_000;
 const POLL_MS = 5_000;
-const REBUILD_MS = 500;
+const BACKOFF_START_MS = 1_000;
+const BACKOFF_MAX_MS = 30_000;
 
 export type StreamMessage = JobMessage | DocumentMessage;
 
@@ -25,6 +26,10 @@ export type StreamSession = {
   close: () => void;
 };
 
+type Listener = OpenHandlers & {
+  session: StreamSession;
+};
+
 type StateFields = {
   seq?: number;
   status?: string;
@@ -35,17 +40,23 @@ type StateFields = {
   error_code?: string | null;
 };
 
+const listeners = new Set<Listener>();
+let source: EventSource | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let staleTimer: ReturnType<typeof setInterval> | null = null;
+let connectTask: Promise<void> | null = null;
+let generation = 0;
+let backoff = BACKOFF_START_MS;
+let lastActivity = 0;
+let mode: StreamMode = "stream";
+
+export function eventsUrl(ticket: string): string {
+  return `/events?ticket=${encodeURIComponent(ticket)}`;
+}
+
 export function isTerminal(kind: "job" | "document", status: string | null | undefined): boolean {
   if (!status) return false;
   return (kind === "document" ? DOCUMENT_TERMINAL : JOB_TERMINAL).has(status);
-}
-
-export function eventsUrl(ids: { jobs: string[]; documents: string[] }): string {
-  const params = new URLSearchParams();
-  for (const id of [...ids.jobs].sort()) params.append("job", id);
-  for (const id of [...ids.documents].sort()) params.append("document", id);
-  const query = params.toString();
-  return query ? `/events?${query}` : "/events";
 }
 
 export function mergeState<T extends StateFields>(current: T, msg: StreamMessage): T {
@@ -96,65 +107,68 @@ function safeCall(work: () => Promise<void> | void) {
   }
 }
 
-export function openEventStream(ids: { jobs: string[]; documents: string[] }, handlers: OpenHandlers): StreamSession {
-  const session: StreamSession = {
-    mode: "stream",
-    close: () => undefined,
-  };
-  const jobs = [...ids.jobs];
-  const documents = [...ids.documents];
-  if (jobs.length + documents.length === 0) return session;
+function publishMode() {
+  for (const listener of listeners) {
+    listener.session.mode = mode;
+    listener.onMode?.(mode);
+  }
+}
 
-  const Source = globalThis.EventSource;
-  const watched = [...jobs, ...documents];
-  const seenAt = new Map<string, number>();
-  const touch = (id?: string) => {
-    const now = Date.now();
-    if (id) {
-      seenAt.set(id, now);
-      return;
-    }
-    for (const item of watched) seenAt.set(item, now);
-  };
-  touch();
+function touch() {
+  lastActivity = Date.now();
+}
 
-  let closed = false;
-  let errors = 0;
-  let source: EventSource | null = new Source(eventsUrl({ jobs, documents }));
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let staleTimer: ReturnType<typeof setInterval> | null = null;
+function dispatch(msg: StreamMessage) {
+  for (const listener of listeners) listener.onMessage(msg);
+}
 
-  const setMode = (mode: StreamMode) => {
-    session.mode = mode;
-    handlers.onMode?.(mode);
-  };
+function refetchAll() {
+  for (const listener of listeners) safeCall(listener.fetchState);
+}
 
-  const enterPolling = () => {
-    if (closed || session.mode === "polling") return;
-    setMode("polling");
-    const current = source;
-    source = null;
-    current?.close();
-    if (staleTimer) {
-      clearInterval(staleTimer);
-      staleTimer = null;
-    }
-    if (pollTimer) return;
-    safeCall(handlers.fetchState);
-    pollTimer = setInterval(() => safeCall(handlers.fetchState), POLL_MS);
-  };
+function haltSocket() {
+  generation += 1;
+  const current = source;
+  source = null;
+  current?.close();
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (staleTimer) {
+    clearInterval(staleTimer);
+    staleTimer = null;
+  }
+  backoff = BACKOFF_START_MS;
+  mode = "stream";
+}
 
-  source.addEventListener("subscribed", () => {
-    errors = 0;
+function scheduleReconnect(gen: number) {
+  if (gen !== generation || listeners.size === 0 || reconnectTimer) return;
+  const delay = backoff;
+  backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (gen !== generation || listeners.size === 0) return;
+    connectTask = connect(gen).finally(() => {
+      connectTask = null;
+    });
+  }, delay);
+}
+
+function bind(current: EventSource, gen: number) {
+  current.addEventListener("subscribed", () => {
+    backoff = BACKOFF_START_MS;
     touch();
-    safeCall(handlers.fetchState);
+    mode = "stream";
+    publishMode();
+    refetchAll();
   });
-  source.addEventListener("resync", () => {
-    errors = 0;
+  current.addEventListener("resync", () => {
     touch();
-    safeCall(handlers.fetchState);
+    refetchAll();
   });
-  source.addEventListener("update", (event) => {
+  current.addEventListener("update", (event) => {
     const raw = (event as MessageEvent).data;
     if (typeof raw !== "string") return;
     let msg: StreamMessage;
@@ -163,43 +177,80 @@ export function openEventStream(ids: { jobs: string[]; documents: string[] }, ha
     } catch {
       return;
     }
-    errors = 0;
-    touch(msg.id);
-    handlers.onMessage(msg);
-  });
-  source.onerror = () => {
-    if (closed || session.mode === "polling") return;
-    errors += 1;
-    if (errors >= 3) enterPolling();
-  };
-
-  staleTimer = setInterval(() => {
-    if (closed || session.mode === "polling") return;
-    const now = Date.now();
-    const quiet = watched.some((id) => now - (seenAt.get(id) ?? 0) >= STALE_MS);
-    if (!quiet) return;
     touch();
-    safeCall(handlers.fetchState);
-  }, POLL_MS);
-
-  session.close = () => {
-    closed = true;
-    source?.close();
-    source = null;
-    if (pollTimer) clearInterval(pollTimer);
-    if (staleTimer) clearInterval(staleTimer);
-    pollTimer = null;
-    staleTimer = null;
+    dispatch(msg);
+  });
+  current.onerror = () => {
+    if (current.readyState !== EventSource.CLOSED) return;
+    if (source === current) source = null;
+    current.close();
+    scheduleReconnect(gen);
   };
+}
+
+async function connect(gen: number) {
+  let ticket: string;
+  try {
+    const body = await request<{ ticket: string }>("/api/events/ticket", { method: "POST" });
+    ticket = body.ticket;
+  } catch {
+    if (gen === generation && listeners.size > 0) scheduleReconnect(gen);
+    return;
+  }
+  if (gen !== generation || listeners.size === 0) return;
+  const Source = globalThis.EventSource;
+  const current = new Source(eventsUrl(ticket));
+  if (gen !== generation || listeners.size === 0) {
+    current.close();
+    return;
+  }
+  source = current;
+  bind(current, gen);
+}
+
+function ensureStaleTimer() {
+  if (staleTimer) return;
+  touch();
+  staleTimer = setInterval(() => {
+    if (listeners.size === 0 || mode !== "stream") return;
+    if (Date.now() - lastActivity < STALE_MS) return;
+    touch();
+    refetchAll();
+  }, POLL_MS);
+}
+
+function ensure() {
+  if (listeners.size === 0 || source || reconnectTimer || connectTask) return;
+  ensureStaleTimer();
+  const gen = generation;
+  connectTask = connect(gen).finally(() => {
+    connectTask = null;
+  });
+}
+
+export function stopEventStream() {
+  haltSocket();
+}
+
+export function openEventStream(handlers: OpenHandlers): StreamSession {
+  const session: StreamSession = {
+    mode,
+    close: () => undefined,
+  };
+  const listener: Listener = { ...handlers, session };
+  listeners.add(listener);
+  session.close = () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) haltSocket();
+  };
+  ensure();
   return session;
 }
 
-export function useEventStream(ids: { jobs: string[]; documents: string[] }, handlers: StreamHandlers): { mode: StreamMode } {
-  const [mode, setMode] = useState<StreamMode>("stream");
+export function useEventStream(handlers: StreamHandlers): { mode: StreamMode } {
+  const [streamMode, setStreamMode] = useState<StreamMode>("stream");
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
-  const jobsKey = [...ids.jobs].sort().join("\n");
-  const documentsKey = [...ids.documents].sort().join("\n");
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -211,29 +262,13 @@ export function useEventStream(ids: { jobs: string[]; documents: string[] }, han
   }, []);
 
   useEffect(() => {
-    const jobs = jobsKey ? jobsKey.split("\n") : [];
-    const documents = documentsKey ? documentsKey.split("\n") : [];
-    if (jobs.length + documents.length === 0) {
-      setMode("stream");
-      return;
-    }
-    let session: StreamSession | null = null;
-    const timer = setTimeout(() => {
-      setMode("stream");
-      session = openEventStream(
-        { jobs, documents },
-        {
-          fetchState: () => handlersRef.current.fetchState(),
-          onMessage: (msg) => handlersRef.current.onMessage(msg),
-          onMode: setMode,
-        },
-      );
-    }, REBUILD_MS);
-    return () => {
-      clearTimeout(timer);
-      session?.close();
-    };
-  }, [jobsKey, documentsKey]);
+    const session = openEventStream({
+      fetchState: () => handlersRef.current.fetchState(),
+      onMessage: (msg) => handlersRef.current.onMessage(msg),
+      onMode: setStreamMode,
+    });
+    return () => session.close();
+  }, []);
 
-  return { mode };
+  return { mode: streamMode };
 }

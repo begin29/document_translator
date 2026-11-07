@@ -56,7 +56,7 @@ def session(_migrated):
     with factory() as db:
         db.execute(
             text(
-                "TRUNCATE documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
+                "TRUNCATE users, documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
             )
         )
         db.execute(text("UPDATE provider_gate SET inflight=0, max_inflight=0, effective_max=ceiling, window_tokens=0, last_429_at=NULL"))
@@ -87,11 +87,11 @@ def _page(number: int, page_class: str) -> PageInfo:
     return PageInfo(page=number, page_class=page_class, route="skip")
 
 
-def _flagged_job(session, tmp_path, name: str, text: str | None = None):
+def _flagged_job(session, tmp_path, name: str, text: str | None = None, owner_id=None):
     body = text or "The motor housing is sealed against dust and water during every ride."
     path = tmp_path / f"{name}.pdf"
     _pdf(path, ["The motor housing is sealed against dust and water during every ride."])
-    document = create_document(session, f"{name}.pdf", path.read_bytes())
+    document = create_document(session, path.read_bytes(), f"{name}.pdf", owner_id)
     session.commit()
     run_analysis(session, document.id)
     session.commit()
@@ -119,10 +119,10 @@ def _usage_result():
 
 
 @needs_db
-def test_agent_usage_recorded(session, tmp_path, monkeypatch):
+def test_agent_usage_recorded(session, tmp_path, monkeypatch, make_user):
     body = ("Alpha beta gamma delta. " * 80) + "ENDMARKER"
     assert len(body) > 1500
-    job = _flagged_job(session, tmp_path, "usage", body)
+    job = _flagged_job(session, tmp_path, "usage", body, make_user().id)
     held = {}
     original_init = ReviewToolkit.__init__
 
@@ -165,8 +165,8 @@ def test_agent_usage_recorded(session, tmp_path, monkeypatch):
 
 
 @needs_db
-def test_agent_failure_logged_and_falls_back(session, tmp_path, monkeypatch):
-    job = _flagged_job(session, tmp_path, "fallback")
+def test_agent_failure_logged_and_falls_back(session, tmp_path, monkeypatch, make_user):
+    job = _flagged_job(session, tmp_path, "fallback", owner_id=make_user().id)
 
     def stub(*_args, **_kwargs):
         raise RuntimeError("agent exploded")

@@ -121,7 +121,7 @@ def _retranslate(session: Session, job: TranslationJob, segment: Segment, provid
         if translated is None:
             continue
         _upsert_translation(session, job.id, row.idx, translated, "agent", segment.id)
-        _tm_put(session, row.src_hash, job.source_lang or "en", job.target_lang, translated, get_settings().review_model)
+        _tm_put(session, job.owner_id, row.src_hash, job.source_lang or "en", job.target_lang, translated, get_settings().review_model)
     _add_cost(session, job, get_settings().review_model, result.tokens_in, result.tokens_out)
 
 

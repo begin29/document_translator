@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import uuid
-from decimal import Decimal
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.auth.deps import current_user, get_session, require_admin
 from app.config import get_settings
-from app.core.errors import AppError
 from app.core.chunking import segment_budget
+from app.core.errors import AppError
 from app.core.languages import LANGUAGES
 from app.core.model_registry import all_models
 from app.core.service import (
@@ -25,23 +25,9 @@ from app.core.service import (
     edit_translation,
     render_job,
 )
-from app.db.models import Block, BlockTranslation, Document, JobEvent, ProviderCall, Segment, TranslationJob
-from app.db.session import session_factory
+from app.db.models import Block, BlockTranslation, Document, JobEvent, ProviderCall, Segment, TranslationJob, User
 
 router = APIRouter()
-
-
-def get_session():
-    factory = session_factory()
-    session = factory()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 class JobIn(BaseModel):
@@ -56,6 +42,14 @@ class JobIn(BaseModel):
 class EditIn(BaseModel):
     block_idx: int
     text: str
+
+
+def owned(session: Session, model, ident: uuid.UUID, user: User):
+    row = session.get(model, ident)
+    if row is None or row.owner_id != user.id:
+        label = "Document" if getattr(model, "__name__", "") == "Document" else "Job"
+        raise AppError("not_found", f"{label} not found.", str(ident), False, 404)
+    return row
 
 
 def _document(document: Document) -> dict:
@@ -108,7 +102,11 @@ def _job(job: TranslationJob, filename: str | None = None) -> dict:
 
 
 @router.post("/documents")
-async def upload_document(file: UploadFile = File(...), session: Session = Depends(get_session)):
+async def upload_document(
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
     settings = get_settings()
     if file.size is not None and file.size > settings.max_upload_bytes:
         raise AppError(
@@ -119,21 +117,20 @@ async def upload_document(file: UploadFile = File(...), session: Session = Depen
             413,
         )
     data = await file.read()
-    document = create_document(session, file.filename or "upload", data)
+    document = create_document(session, data, file.filename or "upload", user.id)
     return _document(document)
 
 
 @router.get("/documents/{document_id}")
-def read_document(document_id: uuid.UUID, session: Session = Depends(get_session)):
-    document = session.get(Document, document_id)
-    if document is None:
-        raise AppError("not_found", "Document not found.", str(document_id), False, 404)
-    return _document(document)
+def read_document(document_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    return _document(owned(session, Document, document_id, user))
 
 
 @router.get("/documents")
-def list_documents(session: Session = Depends(get_session)):
-    rows = session.scalars(select(Document).order_by(Document.created_at.desc()).limit(100)).all()
+def list_documents(session: Session = Depends(get_session), user: User = Depends(current_user)):
+    rows = session.scalars(
+        select(Document).where(Document.owner_id == user.id).order_by(Document.created_at.desc()).limit(100)
+    ).all()
     return [_document(row) for row in rows]
 
 
@@ -141,8 +138,10 @@ def list_documents(session: Session = Depends(get_session)):
 def post_job(
     body: JobIn,
     session: Session = Depends(get_session),
+    user: User = Depends(current_user),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    owned(session, Document, body.document_id, user)
     job = create_job(
         session,
         body.document_id,
@@ -157,10 +156,11 @@ def post_job(
 
 
 @router.get("/jobs")
-def list_jobs(session: Session = Depends(get_session)):
+def list_jobs(session: Session = Depends(get_session), user: User = Depends(current_user)):
     rows = session.execute(
         select(TranslationJob, Document.filename)
         .join(Document, Document.id == TranslationJob.document_id)
+        .where(TranslationJob.owner_id == user.id)
         .order_by(TranslationJob.created_at.desc())
         .limit(100)
     ).all()
@@ -168,24 +168,21 @@ def list_jobs(session: Session = Depends(get_session)):
 
 
 @router.get("/jobs/{job_id}")
-def read_job(job_id: uuid.UUID, session: Session = Depends(get_session)):
-    job = session.get(TranslationJob, job_id)
-    if job is None:
-        raise AppError("not_found", "Job not found.", str(job_id), False, 404)
+def read_job(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    job = owned(session, TranslationJob, job_id, user)
     return _job(job, _filename(session, job.document_id))
 
 
 @router.post("/jobs/{job_id}/cancel")
-def post_cancel(job_id: uuid.UUID, session: Session = Depends(get_session)):
+def post_cancel(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    owned(session, TranslationJob, job_id, user)
     job = cancel_job(session, job_id)
     return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs/{job_id}/segments")
-def read_segments(job_id: uuid.UUID, session: Session = Depends(get_session)):
-    job = session.get(TranslationJob, job_id)
-    if job is None:
-        raise AppError("not_found", "Job not found.", str(job_id), False, 404)
+def read_segments(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    job = owned(session, TranslationJob, job_id, user)
     segments = session.scalars(select(Segment).where(Segment.job_id == job_id).order_by(Segment.idx)).all()
     payload = []
     for segment in segments:
@@ -224,22 +221,28 @@ def read_segments(job_id: uuid.UUID, session: Session = Depends(get_session)):
 
 
 @router.patch("/jobs/{job_id}/segments/{segment_idx}")
-def patch_segment(job_id: uuid.UUID, segment_idx: int, body: EditIn, session: Session = Depends(get_session)):
+def patch_segment(
+    job_id: uuid.UUID,
+    segment_idx: int,
+    body: EditIn,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    owned(session, TranslationJob, job_id, user)
     edit_translation(session, job_id, body.block_idx, body.text)
     return {"ok": True}
 
 
 @router.post("/jobs/{job_id}/render")
-def post_render(job_id: uuid.UUID, session: Session = Depends(get_session)):
+def post_render(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    owned(session, TranslationJob, job_id, user)
     job = render_job(session, job_id)
     return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs/{job_id}/download")
-def download(job_id: uuid.UUID, session: Session = Depends(get_session)):
-    job = session.get(TranslationJob, job_id)
-    if job is None:
-        raise AppError("not_found", "Job not found.", str(job_id), False, 404)
+def download(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    job = owned(session, TranslationJob, job_id, user)
     if job.output_stale or not job.output_path:
         if job.status not in {"done", "rendering"}:
             raise AppError("not_ready", "The translated file is not ready yet.", job.status, True, 409)
@@ -253,7 +256,8 @@ def download(job_id: uuid.UUID, session: Session = Depends(get_session)):
 
 
 @router.get("/jobs/{job_id}/events")
-def events(job_id: uuid.UUID, session: Session = Depends(get_session)):
+def events(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    owned(session, TranslationJob, job_id, user)
     rows = session.scalars(select(JobEvent).where(JobEvent.job_id == job_id).order_by(JobEvent.id)).all()
     return [
         {"id": row.id, "ts": row.ts.isoformat() if row.ts else None, "level": row.level, "event": row.event, "payload": row.payload}
@@ -262,15 +266,14 @@ def events(job_id: uuid.UUID, session: Session = Depends(get_session)):
 
 
 @router.get("/jobs/{job_id}/cost")
-def job_cost(job_id: uuid.UUID, session: Session = Depends(get_session)):
-    if session.get(TranslationJob, job_id) is None:
-        raise AppError("not_found", "Job not found.", str(job_id), False, 404)
+def job_cost(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    owned(session, TranslationJob, job_id, user)
     return cost_for_job(session, job_id)
 
 
 @router.get("/stats/cost")
-def stats(since_hours: int = 24, session: Session = Depends(get_session)):
-    return cost_stats(session, since_hours)
+def stats(since_hours: int = 24, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    return cost_stats(session, user.id, since_hours)
 
 
 @router.get("/meta/languages")
@@ -280,7 +283,8 @@ def languages():
 
 @router.get("/meta/config")
 def meta_config():
-    return {"max_upload_mb": get_settings().max_upload_mb}
+    settings = get_settings()
+    return {"max_upload_mb": settings.max_upload_mb, "allow_signup": settings.allow_signup}
 
 
 @router.get("/meta/models")
@@ -301,9 +305,14 @@ def models(source_lang: str = "en", target_lang: str = "de"):
 
 
 @router.get("/documents/{document_id}/pages/{page_no}/thumbnail")
-def page_thumbnail(document_id: uuid.UUID, page_no: int, session: Session = Depends(get_session)):
-    document = session.get(Document, document_id)
-    if document is None or not document.analysis:
+def page_thumbnail(
+    document_id: uuid.UUID,
+    page_no: int,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    document = owned(session, Document, document_id, user)
+    if not document.analysis:
         raise AppError("not_found", "Document not found.", str(document_id), False, 404)
     match = next((page for page in document.analysis.get("pages", []) if page.get("page") == page_no), None)
     raw = (match or {}).get("thumbnail")
@@ -317,7 +326,7 @@ def page_thumbnail(document_id: uuid.UUID, page_no: int, session: Session = Depe
 
 
 @router.get("/debug/provider-calls")
-def provider_calls(session: Session = Depends(get_session)):
+def provider_calls(session: Session = Depends(get_session), _admin: User = Depends(require_admin)):
     return debug_provider_calls(session)
 
 

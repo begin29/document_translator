@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, desc, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -13,14 +13,52 @@ class Base(DeclarativeBase):
     pass
 
 
-class Document(Base):
-    __tablename__ = "documents"
+class User(Base):
+    __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(Text, unique=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApiToken(Base):
+    __tablename__ = "api_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(Text)
+    prefix: Mapped[str] = mapped_column(String(8))
+    token_hash: Mapped[str] = mapped_column(Text, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (
+        Index("ix_documents_owner_created", "owner_id", desc("created_at")),
+        UniqueConstraint("owner_id", "sha256", name="uq_documents_owner_sha256"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     filename: Mapped[str] = mapped_column(String(255))
     format: Mapped[str] = mapped_column(String(16))
     size_bytes: Mapped[int] = mapped_column(Integer)
-    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    sha256: Mapped[str] = mapped_column(String(64))
     storage_path: Mapped[str] = mapped_column(Text)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     char_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -50,8 +88,10 @@ class Block(Base):
 
 class TranslationJob(Base):
     __tablename__ = "translation_jobs"
+    __table_args__ = (Index("ix_jobs_owner_created", "owner_id", desc("created_at")),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("documents.id"), index=True)
     source_lang: Mapped[str | None] = mapped_column(String(16), nullable=True)
     target_lang: Mapped[str] = mapped_column(String(16))
@@ -112,6 +152,7 @@ class BlockTranslation(Base):
 class TranslationMemory(Base):
     __tablename__ = "translation_memory"
 
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
     src_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_lang: Mapped[str] = mapped_column(String(16), primary_key=True)
     target_lang: Mapped[str] = mapped_column(String(16), primary_key=True)

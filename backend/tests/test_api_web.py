@@ -4,31 +4,15 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
 
-from app.api.routes import router
 from app.config import get_settings
-from app.core.errors import AppError
 from app.core.provider.fake_provider import reset_crash_memory
 from app.core.service import reset_runtime, sync_gate
 from app.db.models import Document
 from app.db.session import reset_engine, session_factory
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL is not set")
-
-
-def _client() -> TestClient:
-    api = FastAPI()
-
-    @api.exception_handler(AppError)
-    def app_error(_request, exc: AppError):
-        return JSONResponse(exc.as_dict(), status_code=exc.status)
-
-    api.include_router(router, prefix="/api")
-    return TestClient(api)
 
 
 @pytest.fixture(scope="module")
@@ -51,7 +35,7 @@ def session(_migrated):
     with factory() as db:
         db.execute(
             text(
-                "TRUNCATE documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
+                "TRUNCATE users, documents, blocks, translation_jobs, segments, block_translations, translation_memory, job_events, provider_calls, ocr_pages RESTART IDENTITY CASCADE"
             )
         )
         db.execute(text("UPDATE provider_gate SET inflight=0, max_inflight=0, effective_max=ceiling, window_tokens=0, last_429_at=NULL"))
@@ -63,15 +47,22 @@ def session(_migrated):
 
 
 def test_meta_config_reports_upload_limit(session):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
     assert session.get_bind() is not None
     get_settings.cache_clear()
-    response = _client().get("/api/meta/config")
+    response = TestClient(app).get("/api/meta/config")
     assert response.status_code == 200
-    assert response.json() == {"max_upload_mb": get_settings().max_upload_mb}
+    settings = get_settings()
+    assert response.json() == {"max_upload_mb": settings.max_upload_mb, "allow_signup": settings.allow_signup}
 
 
-def test_job_payloads_include_document_filename(session):
+def test_job_payloads_include_document_filename(session, make_user, auth_client):
+    user = make_user()
     document = Document(
+        owner_id=user.id,
         filename="quarterly-report.pdf",
         format="pdf",
         size_bytes=128,
@@ -82,7 +73,7 @@ def test_job_payloads_include_document_filename(session):
     )
     session.add(document)
     session.commit()
-    client = _client()
+    client = auth_client(user)
     created = client.post(
         "/api/jobs",
         json={"document_id": str(document.id), "target_lang": "uk", "model": "gpt-4o-mini"},
@@ -100,11 +91,11 @@ def test_job_payloads_include_document_filename(session):
     assert fetched.json()["document_filename"] == "quarterly-report.pdf"
 
 
-def test_upload_over_limit_is_json_413(session, monkeypatch):
+def test_upload_over_limit_is_json_413(session, monkeypatch, auth_client):
     monkeypatch.setenv("MAX_UPLOAD_MB", "1")
     get_settings.cache_clear()
     payload = b"x" * (2 * 1024 * 1024)
-    response = _client().post("/api/documents", files={"file": ("big.pdf", payload, "application/pdf")})
+    response = auth_client().post("/api/documents", files={"file": ("big.pdf", payload, "application/pdf")})
     assert response.status_code == 413
     body = response.json()
     assert body["code"] == "file_too_large"

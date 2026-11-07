@@ -1,6 +1,7 @@
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { ApiError, DocumentRecord, JobRecord, SegmentRecord, request } from "./api";
+import { AuthProvider, LoginPage, RegisterPage, RequireAuth, TokensPage, useAuth } from "./auth";
 import { errorMessage, progressLabel } from "./copy";
 import { applySnapshot, isTerminal, mergeState, useEventStream } from "./useEventStream";
 
@@ -39,17 +40,22 @@ function readFailure(err: unknown): { code?: string; detail?: string } {
 }
 
 function Shell({ children }: { children: ReactNode }) {
+  const { user, logout } = useAuth();
   return (
     <div className="min-h-screen bg-stark-black text-stark-white">
       <header className="border-b border-white/10">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-6 py-5">
           <Link to="/" className="flex items-center gap-3">
             <span className="grid h-9 w-9 place-items-center rounded-full border border-stark-gold text-xs font-semibold tracking-widest text-stark-gold">SF</span>
             <span className="text-sm font-semibold tracking-[0.35em]">STARK</span>
           </Link>
-          <nav className="text-xs uppercase tracking-[0.2em] text-stark-gray">
-            <Link to="/">Translator</Link>
-          </nav>
+          {user && (
+            <nav className="flex items-center gap-4 text-xs uppercase tracking-[0.2em] text-stark-gray">
+              <span className="normal-case tracking-normal text-stark-white">{user.email}</span>
+              <Link to="/settings/tokens">Tokens</Link>
+              <button type="button" onClick={() => void logout()} className="uppercase tracking-[0.2em]">Log out</button>
+            </nav>
+          )}
         </div>
       </header>
       <main className="mx-auto max-w-6xl px-6 py-10">{children}</main>
@@ -78,7 +84,9 @@ function Home() {
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const mounted = useRef(true);
-  const liveJobIds = [...jobs.values()].filter((job) => !isTerminal("job", job.status)).map((job) => job.id);
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+  const unknownFlight = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -113,28 +121,45 @@ function Home() {
     };
   }, []);
 
-  useEventStream(
-    { jobs: liveJobIds, documents: [] },
-    {
-      fetchState: async () => {
-        const rows = await request<JobRecord[]>("/api/jobs");
+  function refreshUnknown() {
+    if (unknownFlight.current) return;
+    const run = request<JobRecord[]>("/api/jobs")
+      .then((rows) => {
         if (!mounted.current) return;
         setJobs((prev) => adoptJobs(prev, rows));
-      },
-      onMessage: (msg) => {
-        if (msg.type !== "job") return;
-        setJobs((prev) => {
-          const existing = prev.get(msg.id);
-          if (!existing) return prev;
-          const next = new Map(prev);
-          const merged = mergeState(existing, msg);
-          next.set(msg.id, merged);
-          rememberedJobs.set(msg.id, merged);
-          return next;
-        });
-      },
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        unknownFlight.current = null;
+      });
+    unknownFlight.current = run;
+  }
+
+  useEventStream({
+    fetchState: async () => {
+      const rows = await request<JobRecord[]>("/api/jobs");
+      if (!mounted.current) return;
+      setJobs((prev) => adoptJobs(prev, rows));
     },
-  );
+    onMessage: (msg) => {
+      if (msg.type !== "job") return;
+      const existing = jobsRef.current.get(msg.id);
+      if (!existing) {
+        refreshUnknown();
+        return;
+      }
+      setJobs((prev) => {
+        const current = prev.get(msg.id);
+        if (!current) return prev;
+        const next = new Map(prev);
+        const merged = mergeState(current, msg);
+        next.set(msg.id, merged);
+        rememberedJobs.set(msg.id, merged);
+        jobsRef.current = next;
+        return next;
+      });
+    },
+  });
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -209,7 +234,6 @@ function DocumentPage() {
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
   const idRef = useRef(id);
   idRef.current = id;
-  const documentIds = id && !isTerminal("document", document?.analysis_status) ? [id] : [];
 
   useEffect(() => {
     request<{ code: string; name: string }[]>("/api/meta/languages").then(setLanguages).catch(() => setLanguages([]));
@@ -234,17 +258,14 @@ function DocumentPage() {
     }
   }
 
-  useEventStream(
-    { jobs: [], documents: documentIds },
-    {
-      fetchState: refreshDocument,
-      onMessage: (msg) => {
-        if (msg.type !== "document" || msg.id !== idRef.current) return;
-        setDocument((current) => (current ? mergeState(current, msg) : current));
-        if (isTerminal("document", msg.analysis_status)) void refreshDocument();
-      },
+  useEventStream({
+    fetchState: refreshDocument,
+    onMessage: (msg) => {
+      if (msg.type !== "document" || msg.id !== idRef.current) return;
+      setDocument((current) => (current ? mergeState(current, msg) : current));
+      if (isTerminal("document", msg.analysis_status)) void refreshDocument();
     },
-  );
+  });
 
   async function translate() {
     setError(null);
@@ -348,7 +369,6 @@ function JobPage() {
   const jobRef = useRef(job);
   jobRef.current = job;
   const detailTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const jobIds = id && !isTerminal("job", job?.status) ? [id] : [];
 
   useEffect(() => {
     setJob(null);
@@ -394,25 +414,22 @@ function JobPage() {
     }, 1000);
   }
 
-  useEventStream(
-    { jobs: jobIds, documents: [] },
-    {
-      fetchState: refreshJob,
-      onMessage: (msg) => {
-        if (msg.type !== "job" || msg.id !== idRef.current) return;
-        setJob((current) => (current ? mergeState(current, msg) : current));
-        if (isTerminal("job", msg.status)) {
-          if (detailTimer.current) {
-            clearTimeout(detailTimer.current);
-            detailTimer.current = null;
-          }
-          void refreshJob();
-          return;
+  useEventStream({
+    fetchState: refreshJob,
+    onMessage: (msg) => {
+      if (msg.type !== "job" || msg.id !== idRef.current) return;
+      setJob((current) => (current ? mergeState(current, msg) : current));
+      if (isTerminal("job", msg.status)) {
+        if (detailTimer.current) {
+          clearTimeout(detailTimer.current);
+          detailTimer.current = null;
         }
-        scheduleDetails();
-      },
+        void refreshJob();
+        return;
+      }
+      scheduleDetails();
     },
-  );
+  });
 
   async function save(blockIdx: number) {
     await request(`/api/jobs/${id}/segments/0`, {
@@ -479,17 +496,22 @@ function JobPage() {
 }
 
 const routes: { path: string; element: ReactNode }[] = [
-  { path: "/", element: <Home /> },
-  { path: "/documents/:id", element: <DocumentPage /> },
-  { path: "/jobs/:id", element: <JobPage /> },
+  { path: "/login", element: <Shell><LoginPage /></Shell> },
+  { path: "/register", element: <Shell><RegisterPage /></Shell> },
+  { path: "/", element: <RequireAuth><Home /></RequireAuth> },
+  { path: "/documents/:id", element: <RequireAuth><DocumentPage /></RequireAuth> },
+  { path: "/jobs/:id", element: <RequireAuth><JobPage /></RequireAuth> },
+  { path: "/settings/tokens", element: <RequireAuth><Shell><TokensPage /></Shell></RequireAuth> },
 ];
 
 export function App() {
   return (
-    <Routes>
-      {routes.map((route) => (
-        <Route key={route.path} path={route.path} element={route.element} />
-      ))}
-    </Routes>
+    <AuthProvider>
+      <Routes>
+        {routes.map((route) => (
+          <Route key={route.path} path={route.path} element={route.element} />
+        ))}
+      </Routes>
+    </AuthProvider>
   );
 }

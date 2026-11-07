@@ -22,17 +22,36 @@ function nonJsonError(response: Response): ApiError {
   return new ApiError(`http_${response.status}`, response.statusText || `HTTP ${response.status}`, response.statusText, response.status);
 }
 
+let unauthorizedHandler = () => {};
+
+export function setUnauthorizedHandler(handler: () => void) {
+  unauthorizedHandler = handler;
+}
+
+function isAuthMe(path: string): boolean {
+  const bare = path.split("?")[0];
+  return bare === "/api/auth/me" || bare === "/auth/me";
+}
+
+function notifyUnauthorized(path: string, status: number) {
+  if (status === 401 && !isAuthMe(path)) unauthorizedHandler();
+}
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
+  const response = await fetch(path, { ...init, credentials: "include" });
   const text = await response.text();
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    if (!response.ok) throw nonJsonError(response);
+    if (!response.ok) {
+      notifyUnauthorized(path, response.status);
+      throw nonJsonError(response);
+    }
     throw new ApiError("invalid_response", "The server returned a response that could not be read.", response.statusText, response.status);
   }
   if (!response.ok) {
+    notifyUnauthorized(path, response.status);
     const record = body && typeof body === "object" ? (body as { code?: string; message?: string; detail?: string }) : {};
     throw new ApiError(
       record.code || `http_${response.status}`,

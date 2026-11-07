@@ -78,7 +78,13 @@ The MCP server starts with the stack:
 docker compose up --build
 ```
 
-Set `MCP_WORKSPACE` in `.env` to the absolute host folder that holds your documents. The server listens on port 8001 and only reads and writes paths inside that folder.
+Set `MCP_WORKSPACE` in `.env` to the absolute host folder that holds your documents. The server listens on port 8001 and only reads and writes paths inside that folder. Each person uses their own API token.
+
+First run:
+
+1. Register at `/register`, or create an account with `python -m app.cli create-user --email you@example.com --password 'at least ten'`.
+2. Create a token in Settings → Tokens. The raw `stk_…` value is shown once.
+3. Add that token to the MCP client config.
 
 Cursor config:
 
@@ -86,7 +92,8 @@ Cursor config:
 {
   "mcpServers": {
     "stark-translator": {
-      "url": "http://localhost:8001/mcp"
+      "url": "http://localhost:8001/mcp",
+      "headers": {"Authorization": "Bearer stk_…"}
     }
   }
 }
@@ -95,13 +102,13 @@ Cursor config:
 Claude Code:
 
 ```bash
-claude mcp add --transport http stark-translator http://localhost:8001/mcp
+claude mcp add --transport http stark-translator http://localhost:8001/mcp --header "Authorization: Bearer stk_…"
 ```
 
-Stdio is still available for local development:
+Stdio reads `TRANSLATOR_API_TOKEN` instead of a request header:
 
 ```bash
-MCP_TRANSPORT=stdio TRANSLATOR_API_URL=http://127.0.0.1:8000 uv run --project backend python -m app.mcp
+MCP_TRANSPORT=stdio TRANSLATOR_API_URL=http://127.0.0.1:8000 TRANSLATOR_API_TOKEN=stk_… uv run --project backend python -m app.mcp
 ```
 
 Three-step check, without the web UI:

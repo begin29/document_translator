@@ -15,7 +15,9 @@ import pytest
 import redis.asyncio
 import uvicorn
 
+from app.auth.tickets import issue
 from app.realtime.app import app
+from app.realtime.app import _uid_connections
 
 
 def _free_port() -> int:
@@ -40,6 +42,9 @@ def realtime(monkeypatch):
         return fakeredis.aioredis.FakeRedis(server=fake)
 
     monkeypatch.setenv("REDIS_URL", "redis://fake:6379/0")
+    monkeypatch.setenv("AUTH_SECRET", "test-secret")
+    monkeypatch.setenv("PROVIDER", "fake")
+    _uid_connections.clear()
     monkeypatch.setattr(redis.asyncio, "from_url", from_url)
     port = _free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", loop="asyncio", lifespan="on", access_log=False)
@@ -72,8 +77,15 @@ async def _next_line(iterator, timeout: float):
 
 
 @pytest.mark.asyncio
+def _ticket(uid=None):
+    uid = uid or uuid.uuid4()
+    ticket, _exp = issue(uid)
+    return uid, ticket
+
+
 async def test_subscribed_then_update(realtime):
     job_id = str(uuid.uuid4())
+    uid, ticket = _ticket()
     payload = {
         "type": "job",
         "id": job_id,
@@ -82,10 +94,11 @@ async def test_subscribed_then_update(realtime):
         "total_segments": 3,
         "cost_cents": 1.5,
         "error_code": None,
+        "owner_id": str(uid),
         "seq": 123,
     }
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("GET", f"{realtime['url']}/events?job={job_id}") as response:
+        async with client.stream("GET", f"{realtime['url']}/events", params={"ticket": ticket}) as response:
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("text/event-stream")
             assert response.headers["cache-control"] == "no-cache"
@@ -102,7 +115,7 @@ async def test_subscribed_then_update(realtime):
                 elif line.startswith("event:"):
                     events.append(line.split(":", 1)[1].strip())
                     if events[-1] == "subscribed":
-                        realtime["redis"].publish(f"job:{job_id}", json.dumps(payload))
+                        realtime["redis"].publish(f"user:{uid}", json.dumps(payload))
                 elif line.startswith("data:") and events and events[-1] == "update":
                     body = json.loads(line.split(":", 1)[1].strip())
     assert retry is not None and 3000 <= retry <= 8000
@@ -114,9 +127,9 @@ async def test_subscribed_then_update(realtime):
 
 @pytest.mark.asyncio
 async def test_one_subscription_for_two_clients(realtime):
-    job_id = str(uuid.uuid4())
-    channel = f"job:{job_id}"
-    url = f"{realtime['url']}/events?job={job_id}"
+    uid, ticket = _ticket()
+    channel = f"user:{uid}"
+    url = f"{realtime['url']}/events?ticket={ticket}"
 
     async def hold(started: asyncio.Event):
         async with httpx.AsyncClient(timeout=None) as client:
@@ -142,17 +155,34 @@ async def test_one_subscription_for_two_clients(realtime):
     assert _subscribers(realtime["redis"], channel) == 0
 
 
-def test_rejects_too_many_ids_and_bad_uuid(realtime):
-    too_many = "&".join(f"job={uuid.uuid4()}" for _ in range(51))
-    overflow = httpx.get(f"{realtime['url']}/events?{too_many}", timeout=2)
-    assert overflow.status_code == 400
-    assert overflow.headers["content-type"].startswith("application/json")
-    invalid = httpx.get(f"{realtime['url']}/events?job=not-a-uuid", timeout=2)
-    assert invalid.status_code == 400
+def test_eleventh_connection_is_limited(realtime):
+    _uid, ticket = _ticket()
+    url = f"{realtime['url']}/events"
+    held = []
+    try:
+        for _ in range(10):
+            client = httpx.Client(timeout=None)
+            response = client.send(client.build_request("GET", url, params={"ticket": ticket}), stream=True)
+            assert response.status_code == 200
+            held.append((client, response))
+        blocked = httpx.get(url, params={"ticket": ticket}, timeout=2)
+        assert blocked.status_code == 429
+        assert blocked.json()["code"] == "too_many_attempts"
+    finally:
+        for client, response in held:
+            response.close()
+            client.close()
+
+
+def test_rejects_a_missing_or_bad_ticket(realtime):
+    missing = httpx.get(f"{realtime['url']}/events", timeout=2)
+    assert missing.status_code == 401
+    assert missing.headers["content-type"].startswith("application/json")
+    assert missing.json()["code"] == "unauthorized"
+    invalid = httpx.get(f"{realtime['url']}/events", params={"ticket": "not-a-ticket"}, timeout=2)
+    assert invalid.status_code == 401
     assert invalid.headers["content-type"].startswith("application/json")
-    empty = httpx.get(f"{realtime['url']}/events", timeout=2)
-    assert empty.status_code == 400
-    assert empty.headers["content-type"].startswith("application/json")
+    assert invalid.json()["code"] == "unauthorized"
 
 
 def test_import_does_not_load_sqlalchemy():
@@ -172,9 +202,9 @@ def test_import_does_not_load_sqlalchemy():
 
 @pytest.mark.asyncio
 async def test_replaced_redis_connection_sends_resync(realtime):
-    job_id = str(uuid.uuid4())
+    _uid, ticket = _ticket()
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("GET", f"{realtime['url']}/events?job={job_id}") as response:
+        async with client.stream("GET", f"{realtime['url']}/events", params={"ticket": ticket}) as response:
             iterator = response.aiter_lines()
             events = []
             deadline = time.monotonic() + 4
@@ -195,9 +225,9 @@ async def test_replaced_redis_connection_sends_resync(realtime):
 @pytest.mark.asyncio
 async def test_ping_and_metrics(realtime, monkeypatch):
     monkeypatch.setattr("app.realtime.app.PING_INTERVAL_SECONDS", 0.3)
-    job_id = str(uuid.uuid4())
+    _uid, ticket = _ticket()
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("GET", f"{realtime['url']}/events?job={job_id}") as response:
+        async with client.stream("GET", f"{realtime['url']}/events", params={"ticket": ticket}) as response:
             iterator = response.aiter_lines()
             saw_ping = False
             deadline = time.monotonic() + 3
