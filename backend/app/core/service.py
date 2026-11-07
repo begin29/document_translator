@@ -16,6 +16,7 @@ from app.core.analysis.preprocess import preprocess_page, to_png
 from app.core.chunking import chunk_blocks, segment_budget
 from app.core.domain import BlockData
 from app.core.errors import AppError, CostCapExceeded, InjectedCrash, RateLimited
+from app.core.events import after_commit, publish_document, publish_job
 from app.core.formats.registry import adapter_for, detect_format
 from app.core.formats.sniff import sanitized_filename
 from app.core.languages import known_language
@@ -149,16 +150,19 @@ def run_analysis(session: Session, document_id: uuid.UUID) -> None:
             document.analysis_status = "ready"
             document.error_code = None
             document.error_detail = None
+            _publish_document(session, document)
             logger.info("analysis_ready", pages=extracted.page_count, blocks=len(ordered))
     except AppError as exc:
         document.analysis_status = "failed"
         document.error_code = exc.code
         document.error_detail = exc.message
+        _publish_document(session, document)
         logger.info("analysis_failed", error_code=exc.code)
     except Exception as exc:
         document.analysis_status = "failed"
         document.error_code = "analysis_failed"
         document.error_detail = str(exc)
+        _publish_document(session, document)
         logger.info("analysis_failed", error_code="analysis_failed")
 
 
@@ -356,6 +360,7 @@ def cancel_job(session: Session, job_id: uuid.UUID) -> TranslationJob:
     job.error_code = "cancelled"
     job.error_detail = "Cancelled by the client."
     _event(session, job.id, "cancelled", {})
+    _publish_job(session, job)
     return job
 
 
@@ -575,6 +580,7 @@ def _extract_job(session: Session, job_id: uuid.UUID, worker_id: str) -> None:
         job.status = "ocr"
         job.locked_by = None
         _event(session, job.id, "ocr_started", {"pages": ocr_pages})
+        _publish_job(session, job)
         logger.info("ocr_queued", pages=ocr_pages)
         return
     _ensure_summary(session, job, document)
@@ -724,6 +730,7 @@ def _build_segments(session: Session, job: TranslationJob) -> None:
     job.done_segments = done
     job.status = "translating" if pieces else "reviewing"
     job.locked_by = None
+    _publish_job(session, job)
     if not pieces:
         _fail(session, job, "empty_document", "Nothing translatable was found in this document.")
         return
@@ -942,6 +949,7 @@ def _review_job(session: Session, job_id: uuid.UUID, worker_id: str) -> None:
         _event(session, job.id, "quality_warning", {"detail": "One or more segments were retranslated after a quality check."})
     job.status = "rendering"
     job.locked_by = None
+    _publish_job(session, job)
     logger.info("review_done", quality_warning=bool(warning))
 
 
@@ -973,6 +981,7 @@ def _claim_render(session: Session, worker_id: str) -> bool:
         job.output_stale = False
         job.locked_by = None
         _event(session, job.id, "done", {"output": job.output_path, "cost_cents": float(job.cost_cents or 0)})
+        _publish_job(session, job)
         log.bind(job_id=str(job.id), stage="render", worker_id=worker_id).info("render_done")
     except AppError as exc:
         _fail(session, job, exc.code, exc.message)
@@ -1218,7 +1227,7 @@ def _add_progress(
     cents = cost if cost is not None else Decimal(0)
     if not segments and not tokens_in and not tokens_out and cents == 0:
         return
-    session.execute(
+    result = session.execute(
         text(
             """
             UPDATE translation_jobs
@@ -1227,10 +1236,14 @@ def _add_progress(
                 tokens_out = COALESCE(tokens_out, 0) + :tokens_out,
                 cost_cents = COALESCE(cost_cents, 0) + :cost
             WHERE id = :id
+            RETURNING id, status, done_segments, total_segments, cost_cents, error_code
             """
         ),
         {"segments": segments, "tokens_in": tokens_in, "tokens_out": tokens_out, "cost": cents, "id": job.id},
-    )
+    ).mappings().first()
+    if result is not None:
+        state = dict(result)
+        after_commit(session, lambda state=state: publish_job(state))
     session.expire(job, ["done_segments", "tokens_in", "tokens_out", "cost_cents"])
 
 
@@ -1250,12 +1263,34 @@ def _check_cap(session: Session, job: TranslationJob) -> None:
         _fail(session, job, raise_cost.code, raise_cost.message)
 
 
+def _publish_job(session: Session, job: TranslationJob) -> None:
+    state = {
+        "id": job.id,
+        "status": job.status,
+        "done_segments": job.done_segments or 0,
+        "total_segments": job.total_segments or 0,
+        "cost_cents": job.cost_cents or 0,
+        "error_code": job.error_code,
+    }
+    after_commit(session, lambda state=state: publish_job(state))
+
+
+def _publish_document(session: Session, document: Document) -> None:
+    state = {
+        "id": document.id,
+        "analysis_status": document.analysis_status,
+        "error_code": document.error_code,
+    }
+    after_commit(session, lambda state=state: publish_document(state))
+
+
 def _fail(session: Session, job: TranslationJob, code: str, message: str) -> None:
     job.status = "failed"
     job.error_code = code
     job.error_detail = message
     job.locked_by = None
     _event(session, job.id, "failed", {"code": code, "message": message})
+    _publish_job(session, job)
 
 
 def _event(session: Session, job_id: uuid.UUID, event: str, payload: dict, level: str = "info") -> None:

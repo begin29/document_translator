@@ -1,0 +1,12 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 10 }
+  realtime:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    command: ["python", "-m", "app.realtime"]
+    env_file: .env
+    environment: { REDIS_URL: "redis://redis:6379/0" }
+    ports: ["8002:8002"]
+    depends_on: { redis: { condition: service_healthy } }

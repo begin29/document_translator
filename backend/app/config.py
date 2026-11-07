@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     otel_endpoint: str = "http://langfuse:4318/v1/traces"
     agent_trace_exporter: str = "openai"
     cors_origins: str = "*"
+    redis_url: str = ""
+    redis_cluster: bool = False
     worker_id: str = ""
     global_quality_cap: int = 2000
     prompt_overhead_tokens: int = 800
