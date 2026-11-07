@@ -1,3 +1,6 @@
+include:
+  - compose.realtime.yml
+
 services:
   db:
     image: postgres:16-alpine
@@ -53,6 +56,21 @@ services:
       - "8080:80"
     depends_on:
       - api
+
+  mcp:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    command: ["python", "-m", "app.mcp"]
+    env_file: .env
+    environment:
+      TRANSLATOR_API_URL: http://api:8000
+      REALTIME_URL: http://realtime:8002
+      MCP_TRANSPORT: streamable-http
+      MCP_PORT: "8001"
+      MCP_WORKSPACE: ${MCP_WORKSPACE:-/tmp/stark-translator}
+    volumes:
+      - ${MCP_WORKSPACE:-/tmp/stark-translator}:${MCP_WORKSPACE:-/tmp/stark-translator}
+    ports: ["8001:8001"]
+    depends_on: [api, realtime]
 
   prometheus:
     image: prom/prometheus:v2.55.1

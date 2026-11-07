@@ -1,25 +1,92 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 
-from app.mcp.client import HttpClient, InProcessClient
+from app.mcp.client import ApiClient, ApiError
 
-mcp = FastMCP("stark-translator")
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+_sources: dict[str, str] = {}
 
 
-def _client():
-    base = os.environ.get("TRANSLATOR_API_URL", "").strip()
-    if base:
-        return HttpClient(base)
-    return InProcessClient()
+def _security() -> TransportSecuritySettings:
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["localhost:*", "127.0.0.1:*", "mcp:*", "[::1]:*"],
+        allowed_origins=["http://localhost:*", "http://127.0.0.1:*", "http://mcp:*", "http://[::1]:*"],
+    )
+
+
+mcp = FastMCP(
+    "stark-translator",
+    host=os.environ.get("MCP_HOST", "0.0.0.0"),
+    port=int(os.environ.get("MCP_PORT", "8001")),
+    streamable_http_path="/mcp",
+    transport_security=_security(),
+)
+
+
+def _client() -> ApiClient:
+    base = os.environ.get("TRANSLATOR_API_URL", "").strip() or "http://127.0.0.1:8000"
+    realtime = os.environ.get("REALTIME_URL", "").strip() or "http://127.0.0.1:8002"
+    return ApiClient(base, realtime)
+
+
+def _workspace() -> Path | None:
+    raw = os.environ.get("MCP_WORKSPACE", "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
+def _resolve(path: str) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    root = _workspace()
+    if root is not None and not resolved.is_relative_to(root):
+        raise ApiError("path_outside_workspace", f"{resolved} is outside the workspace.", False)
+    return resolved
+
+
+def _fail(exc: ApiError) -> ToolError:
+    return ToolError(f"{exc.code}: {exc.message}")
+
+
+def _default_output(source: Path, target_language: str) -> Path:
+    suffix = ".pdf" if source.suffix.lower() in _IMAGE_SUFFIXES else source.suffix
+    return source.with_name(f"{source.stem}.{target_language}{suffix}")
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    temporary = Path(f"{path}.tmp")
+    temporary.write_bytes(data)
+    os.replace(temporary, path)
+
+
+def _remember(job_id: str, source: Path) -> None:
+    _sources[str(job_id)] = str(source)
 
 
 @mcp.tool()
-def estimate_translation(path: str, target_language: str, source_language: str | None = None) -> dict:
+async def estimate_translation(path: str, target_language: str, source_language: str | None = None) -> dict:
     """Estimate tokens, segments, and price for a document before translating it."""
-    return _client().estimate(path, target_language, source_language)
+    try:
+        source = _resolve(path)
+        async with _client() as api:
+            uploaded = await api.upload(str(source))
+            document = await api.wait_document(uploaded["id"])
+        analysis = document.get("analysis") or {}
+        return {
+            "document_id": document["id"],
+            "filename": document["filename"],
+            "models": analysis.get("models") or [],
+            "pages": analysis.get("pages") or [],
+        }
+    except ApiError as exc:
+        raise _fail(exc) from exc
 
 
 @mcp.tool()
@@ -28,54 +95,77 @@ async def translate_document(
     target_language: str,
     source_language: str | None = None,
     output_path: str | None = None,
+    wait: bool = False,
     ctx: Context = None,
 ) -> dict:
-    """Translate a PDF, DOCX, or photo and write the result next to the source file."""
-    import anyio
+    """Translate a PDF, DOCX, or photo. Returns a job id immediately unless wait is true."""
+    try:
+        source = _resolve(path)
+        target = _resolve(output_path) if output_path else None
+        async with _client() as api:
+            uploaded = await api.upload(str(source))
+            document = await api.wait_document(uploaded["id"])
+            job = await api.create_job(document["id"], target_language, source_language)
+            _remember(job["id"], source)
+            if not wait:
+                return {"job_id": job["id"], "status": job["status"], "document_id": document["id"]}
 
-    holder: dict = {"result": None, "error": None, "progress": None}
+            async def on_progress(done: int, total: int, status: str) -> None:
+                if ctx is not None:
+                    await ctx.report_progress(done, total, status)
 
-    def work() -> None:
-        def on_progress(done: int, total: int, status: str) -> None:
-            holder["progress"] = (done, total or 1, status)
-
-        try:
-            holder["result"] = _client().translate(path, target_language, source_language, output_path, on_progress)
-        except Exception as exc:
-            holder["error"] = exc
-
-    async with anyio.create_task_group() as group:
-        group.start_soon(anyio.to_thread.run_sync, work)
-
-        async def watch() -> None:
-            last = None
-            while holder["result"] is None and holder["error"] is None:
-                progress = holder.get("progress")
-                if ctx is not None and progress and progress != last:
-                    await ctx.report_progress(progress[0], progress[1])
-                    last = progress
-                await anyio.sleep(0.2)
-
-        group.start_soon(watch)
-    if holder["error"]:
-        raise holder["error"]
-    return holder["result"]
+            finished = await api.wait_job(job["id"], on_progress)
+            destination = target or _resolve(str(_default_output(source, target_language)))
+            _write_atomic(destination, await api.download(finished["id"]))
+        return {
+            "job_id": finished["id"],
+            "output_path": str(destination),
+            "cost_cents": finished.get("cost_cents"),
+            "status": finished.get("status"),
+        }
+    except ApiError as exc:
+        raise _fail(exc) from exc
 
 
 @mcp.tool()
-def get_translation_status(job_id: str) -> dict:
+async def get_translation_status(job_id: str) -> dict:
     """Read the status of a translation job."""
-    return _client().status(job_id)
+    try:
+        async with _client() as api:
+            return await api.get_job(job_id)
+    except ApiError as exc:
+        raise _fail(exc) from exc
 
 
 @mcp.tool()
-def download_translation(job_id: str, output_path: str) -> dict:
-    """Download a finished translation to output_path."""
-    return _client().download(job_id, output_path)
+async def download_translation(job_id: str, output_path: str | None = None) -> dict:
+    """Download a finished translation. Writes next to the source when output_path is omitted."""
+    try:
+        async with _client() as api:
+            if output_path:
+                target = _resolve(output_path)
+            else:
+                source_path = _sources.get(str(job_id))
+                if not source_path:
+                    raise ApiError(
+                        "source_unknown",
+                        "Pass output_path. The source file for this job is not known.",
+                        False,
+                    )
+                job = await api.get_job(job_id)
+                target = _resolve(str(_default_output(Path(source_path), job["target_lang"])))
+            _write_atomic(target, await api.download(job_id))
+        return {"job_id": job_id, "output_path": str(target)}
+    except ApiError as exc:
+        raise _fail(exc) from exc
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    transport = os.environ.get("MCP_TRANSPORT", "streamable-http").strip() or "streamable-http"
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+        return
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":

@@ -72,36 +72,43 @@ npm run build
 
 ## MCP
 
-Stdio server:
+The MCP server starts with the stack:
 
 ```bash
-uv run --project backend python -m app.mcp
+docker compose up --build
 ```
 
-Cursor or Claude Code config:
+Set `MCP_WORKSPACE` in `.env` to the absolute host folder that holds your documents. The server listens on port 8001 and only reads and writes paths inside that folder.
+
+Cursor config:
 
 ```json
 {
   "mcpServers": {
     "stark-translator": {
-      "command": "uv",
-      "args": ["run", "--project", "backend", "python", "-m", "app.mcp"],
-      "env": {
-        "TRANSLATOR_API_URL": "http://127.0.0.1:8000",
-        "DATABASE_URL": "postgresql+psycopg://translator:translator@127.0.0.1:5432/translator"
-      }
+      "url": "http://localhost:8001/mcp"
     }
   }
 }
 ```
 
-Leave `TRANSLATOR_API_URL` empty to use the in-process client, which needs `DATABASE_URL` and `FILES_DIR` and does not need the API process.
+Claude Code:
+
+```bash
+claude mcp add --transport http stark-translator http://localhost:8001/mcp
+```
+
+Stdio is still available for local development:
+
+```bash
+MCP_TRANSPORT=stdio TRANSLATOR_API_URL=http://127.0.0.1:8000 uv run --project backend python -m app.mcp
+```
 
 Three-step check, without the web UI:
 
-1. `estimate_translation` on a small PDF. The reply lists models and a price.
-2. `translate_document` to German. The tool reports progress and returns an output path.
-3. `get_translation_status` on that job id returns `done`. The file from step 2 opens as a PDF or DOCX.
+1. `translate_document` on a small PDF. The reply returns `job_id` immediately (`wait` defaults to false).
+2. `get_translation_status` on that job id until the status is `done`.
+3. `download_translation` writes the file. Pass `wait=true` to `translate_document` to report progress and download in the same call.
 
 ## Acceptance
 

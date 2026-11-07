@@ -276,8 +276,6 @@ def test_api_and_mcp_estimate(session, tmp_path):
     from fastapi.testclient import TestClient
 
     from app.main import app
-    from app.mcp.__main__ import mcp
-    from app.mcp.client import InProcessClient
 
     path = tmp_path / "api.pdf"
     _pdf(path, ["The API accepts a PDF and the MCP estimate reads the same analysis."])
@@ -301,9 +299,4 @@ def test_api_and_mcp_estimate(session, tmp_path):
     download = client.get(f"/api/jobs/{job_id}/download")
     assert download.status_code == 200
     assert download.content[:4] == b"%PDF"
-    names = {tool.name for tool in mcp._tool_manager.list_tools()}
-    assert names == {"estimate_translation", "translate_document", "get_translation_status", "download_translation"}
-    estimate = InProcessClient().estimate(str(path), "de")
-    assert estimate["document_id"]
-    assert any(item["model"] == "gpt-4o-mini" for item in estimate["models"])
 

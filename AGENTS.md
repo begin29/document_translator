@@ -22,7 +22,7 @@ Deeper context, read only when the task needs it: `README.md` (run, MCP, accepta
 | `backend/app/core/errors.py` | `AppError` and provider error types |
 | `backend/app/api/routes.py` | HTTP shell. Routers mounted at `/api` |
 | `backend/app/worker.py` | Thread loop: `reap`, `sync_gate`, `process_available` |
-| `backend/app/mcp/` | Four tools plus `HttpClient` / `InProcessClient` |
+| `backend/app/mcp/` | Four async tools on `ApiClient`. Streamable HTTP on :8001, SSE waits, `wait` flag |
 | `backend/app/db/models.py` | SQLAlchemy models. Migrations in `backend/alembic/` |
 | `backend/app/config.py` | `Settings` from env. `get_settings()` is cached |
 | `frontend/src/` | `App.tsx` (routes), `api.ts`, `copy.ts` (error strings) |
@@ -58,7 +58,7 @@ Errors are `AppError` → `{code, message, detail, retryable}` with a real statu
 
 `POST /api/jobs` honors `Idempotency-Key` and returns the existing job. Same sha256 returns the existing document. Uploads stay under `FILES_DIR` (`uploads/`, `assets/`, `thumbs/`). Filename is the basename only.
 
-MCP tools, and only these: `estimate_translation`, `translate_document`, `get_translation_status`, `download_translation`. `TRANSLATOR_API_URL` selects `HttpClient`; empty uses `InProcessClient`.
+MCP tools, and only these: `estimate_translation`, `translate_document`, `get_translation_status`, `download_translation`. The server speaks streamable HTTP on port 8001 (`/mcp`) and can still run over stdio. Tools use `ApiClient` only. Waiting follows the realtime SSE stream, with REST polling only if that stream cannot be reached. `translate_document` returns `{job_id, status, document_id}` unless `wait` is true.
 
 `GET /health`, `GET /ready` (DB ping), `GET /metrics` are unprefixed. `GET /api/debug/provider-calls` exists only when `PROVIDER=fake`.
 
