@@ -146,6 +146,15 @@ class ApiClient:
     async def get_document(self, document_id: str) -> dict:
         return await self._get_visible(f"/api/documents/{document_id}")
 
+    async def estimate_document(self, document_id: str, target_lang: str) -> dict:
+        assert self._http is not None
+        response = await self._http.get(
+            f"/api/documents/{document_id}/estimate",
+            params={"target_lang": target_lang},
+        )
+        self._check(response)
+        return response.json()
+
     async def create_job(self, document_id: str, target: str, source: str | None) -> dict:
         payload: dict[str, str] = {"document_id": document_id, "target_lang": target}
         if source:

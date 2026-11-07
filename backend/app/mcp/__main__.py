@@ -121,11 +121,13 @@ async def estimate_translation(
         async with _client(ctx) as api:
             uploaded = await api.upload(str(source))
             document = await api.wait_document(uploaded["id"])
+            quote = await api.estimate_document(document["id"], target_language)
         analysis = document.get("analysis") or {}
         return {
             "document_id": document["id"],
             "filename": document["filename"],
-            "models": analysis.get("models") or [],
+            "target_language": target_language,
+            "models": quote.get("models") or [],
             "pages": analysis.get("pages") or [],
         }
     except ApiError as exc:

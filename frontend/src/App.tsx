@@ -235,7 +235,7 @@ function DocumentPage() {
   const [document, setDocument] = useState<DocumentRecord | null>(null);
   const [model, setModel] = useState("gpt-4o-mini");
   const [target, setTarget] = useState("de");
-  const [mode, setMode] = useState("reflow");
+  const [mode, setMode] = useState("layout");
   const [languages, setLanguages] = useState<{ code: string; name: string }[]>([]);
   const [quotes, setQuotes] = useState<EstimateModel[] | null>(null);
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
@@ -373,8 +373,8 @@ function DocumentPage() {
             </div>
             <label className="mt-4 block text-xs uppercase tracking-[0.16em] text-stark-gray">PDF layout
               <select value={mode} onChange={(event) => setMode(event.target.value)} className="mt-2 w-full bg-black p-2 text-sm normal-case tracking-normal">
+                <option value="layout">Preserve layout</option>
                 <option value="reflow">Reflow</option>
-                <option value="layout">Preserve layout (beta)</option>
               </select>
             </label>
             <button onClick={translate} className="mt-5 bg-stark-gold px-5 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-black">Translate</button>

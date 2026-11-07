@@ -21,6 +21,7 @@ export const ERROR_COPY: Record<string, string> = {
   service_unavailable: "The translator is temporarily unavailable. Try again in a moment.",
   invalid_response: "The server returned a response that could not be read.",
   path_outside_workspace: "That file path is outside the workspace.",
+  source_unknown: "The source file for this download is not known. Pass an output path.",
   not_found: "That document or translation could not be found.",
   unauthorized: "Sign in to continue.",
   csrf_failed: "The request was rejected. Refresh the page and try again.",

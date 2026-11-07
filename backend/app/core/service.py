@@ -407,7 +407,7 @@ def create_job(
     model: str | None,
     glossary: list[dict] | None,
     idempotency_key: str | None,
-    render_mode: str = "reflow",
+    render_mode: str = "layout",
 ) -> TranslationJob:
     document = session.get(Document, document_id)
     if document is None:
@@ -446,14 +446,11 @@ def create_job(
         glossary=glossary or [],
         idempotency_key=idempotency_key,
         render_mode=render_mode,
+        estimate_cents=quote["cost_cents"],
         status="queued",
     )
     session.add(job)
     session.flush()
-    session.execute(
-        text("UPDATE translation_jobs SET estimate_cents = :cents WHERE id = :id"),
-        {"cents": quote["cost_cents"], "id": job.id},
-    )
     _event(session, job.id, "job_queued", {"model": spec.alias, "target": target})
     return job
 
@@ -749,7 +746,7 @@ def _ocr_page(session: Session, job_id: uuid.UUID, page_no: int, worker_id: str)
             model=get_settings().ocr_model,
             tokens_in=result.tokens_in,
             tokens_out=result.tokens_out,
-            tokens_cached=0,
+            tokens_cached=result.tokens_cached,
             latency_ms=int((time.perf_counter() - started) * 1000),
             status="ok",
             error_code=None,
@@ -1217,7 +1214,7 @@ def _ensure_summary(session: Session, job: TranslationJob, document: Document) -
     try:
         result = _call_with_retries(session, request)
         job.summary = result.text[:1200]
-        _add_cost(session, job, request.model, result.tokens_in, result.tokens_out, getattr(result, "recorded_cents", None))
+        _add_cost(session, job, request.model, result.tokens_in, result.tokens_out, result.recorded_cents)
     except AppError:
         job.summary = excerpt[:400]
     finally:
@@ -1370,33 +1367,12 @@ def _add_progress(
 def _add_cost(
     session: Session,
     job: TranslationJob,
-    model: str,
-    tokens_in: int,
-    tokens_out: int,
-    cents: Decimal | None = None,
+    _model: str,
+    _tokens_in: int,
+    _tokens_out: int,
+    cents: Decimal,
 ) -> None:
-    amount = cents
-    if amount is None:
-        recorded = session.execute(
-            text(
-                """
-                SELECT cost_cents FROM provider_calls
-                WHERE job_id = :job AND tokens_in = :tokens_in AND tokens_out = :tokens_out AND status = 'ok'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ),
-            {"job": job.id, "tokens_in": tokens_in, "tokens_out": tokens_out},
-        ).scalar()
-        if recorded is None:
-            try:
-                spec = resolve_model(model)
-            except AppError:
-                return
-            amount = cost_cents(spec, tokens_in, tokens_out, 0)
-        else:
-            amount = Decimal(recorded)
-    _add_progress(session, job, cost=amount)
+    _add_progress(session, job, cost=cents)
 
 
 def _check_cap(session: Session, job: TranslationJob) -> None:
@@ -1580,16 +1556,6 @@ def debug_provider_calls(session: Session) -> dict:
         "max_inflight": gate.max_inflight,
         "effective_max": gate.effective_max,
     }
-
-
-def stored_estimates(session: Session, job_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal | None]:
-    if not job_ids:
-        return {}
-    rows = session.execute(
-        text("SELECT id, estimate_cents FROM translation_jobs WHERE id = ANY(:ids)"),
-        {"ids": list(job_ids)},
-    ).all()
-    return {row.id: row.estimate_cents for row in rows}
 
 
 def cost_for_job(session: Session, job_id: uuid.UUID) -> dict:

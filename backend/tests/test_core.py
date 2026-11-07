@@ -285,12 +285,15 @@ def test_layout_reflows_only_overflow_pages(tmp_path):
 
 
 def test_not_a_document_guardrail_trips():
-    from app.core.agents.document_guardrail import not_a_document_guardrail, pages_are_not_a_document
+    from app.core.agents.document_guardrail import ensure_is_document, pages_are_not_a_document
+    from app.core.domain import PageInfo
 
     assert pages_are_not_a_document(["non_document", "non_document"])
     assert not pages_are_not_a_document(["blank"])
-    verdict = not_a_document_guardrail.guardrail_function(None, None, "non_document:1")
-    assert verdict.tripwire_triggered
+    with pytest.raises(AppError) as exc:
+        ensure_is_document([PageInfo(page=1, page_class="non_document", route="reject")])
+    assert exc.value.code == "not_a_document"
+    ensure_is_document([PageInfo(page=1, page_class="text", route="text")])
 
 
 def test_meta_models_include_segment_budget():

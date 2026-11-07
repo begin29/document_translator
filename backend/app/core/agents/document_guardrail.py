@@ -16,22 +16,3 @@ def ensure_is_document(pages: list[PageInfo]) -> None:
         "No readable document content was found. Pages look like photos or graphics without text.",
         "pages=" + ",".join(str(page.page) for page in pages),
     )
-
-
-class _Tripwire:
-    def __init__(self, tripwire_triggered: bool) -> None:
-        self.tripwire_triggered = tripwire_triggered
-
-
-def _legacy_not_a_document(_ctx, _agent, payload):
-    text = payload if isinstance(payload, str) else ""
-    triggered = text == "non_document" or text.startswith("non_document")
-    return _Tripwire(triggered)
-
-
-class _LegacyGuardrail:
-    pass
-
-
-not_a_document_guardrail = _LegacyGuardrail()
-setattr(not_a_document_guardrail, "guardrail" + "_function", _legacy_not_a_document)

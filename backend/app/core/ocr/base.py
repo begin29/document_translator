@@ -15,6 +15,7 @@ class OcrResult:
     blocks: list[OcrBlock]
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_cached: int = 0
     already_recorded: bool = False
 
 

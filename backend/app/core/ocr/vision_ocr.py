@@ -29,7 +29,12 @@ class VisionOcrProvider:
             )
         )
         blocks = _parse(result.text)
-        return OcrResult(blocks=blocks, tokens_in=result.tokens_in, tokens_out=result.tokens_out, already_recorded=True)
+        return OcrResult(
+            blocks=blocks,
+            tokens_in=result.tokens_in,
+            tokens_out=result.tokens_out,
+            tokens_cached=result.tokens_cached,
+        )
 
 
 def _parse(raw: str) -> list[OcrBlock]:

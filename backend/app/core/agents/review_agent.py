@@ -122,7 +122,7 @@ def _retranslate(session: Session, job: TranslationJob, segment: Segment, provid
             continue
         _upsert_translation(session, job.id, row.idx, translated, "agent", segment.id)
         _tm_put(session, job.owner_id, row.src_hash, job.source_lang or "en", job.target_lang, translated, get_settings().review_model)
-    _add_cost(session, job, get_settings().review_model, result.tokens_in, result.tokens_out)
+    _add_cost(session, job, get_settings().review_model, result.tokens_in, result.tokens_out, result.recorded_cents)
 
 
 class ReviewToolkit:
@@ -236,7 +236,7 @@ def _record_agent_usage(session: Session, job: TranslationJob, model: str, respo
     share = elapsed_ms // len(responses)
     for response in responses:
         tokens_in, tokens_out, tokens_cached = _usage_counts(getattr(response, "usage", None))
-        _record(
+        cents = _record(
             stage="review_agent",
             model=model,
             job_id=job.id,
@@ -246,7 +246,7 @@ def _record_agent_usage(session: Session, job: TranslationJob, model: str, respo
             latency_ms=share,
             status="ok",
         )
-        _add_cost(session, job, model, tokens_in, tokens_out)
+        _add_cost(session, job, model, tokens_in, tokens_out, cents)
 
 
 def _run_agent(session: Session, job: TranslationJob, flagged: list[tuple[Segment, list[str]]], provider) -> bool:

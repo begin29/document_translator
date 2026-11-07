@@ -1,10 +1,10 @@
 # Prompts
 
-`PROMPT_VERSION` is `v1` in `backend/app/core/prompts.py`. Provider calls store the version so a prompt change is visible in `provider_calls`.
+`PROMPT_VERSION` is `v2` in `backend/app/core/prompts.py`. Provider calls store the version so a prompt change is visible in `provider_calls`.
 
 ## Translate
 
-System prompt tells the model the source and target languages, the glossary, and a short document summary. It must return JSON:
+The system prompt names the source and target languages (`Ukrainian (uk)`, not a bare `uk`). It also includes the glossary and a short document summary. The model must return JSON:
 
 ```json
 {"blocks":[{"n":1,"text":"..."}]}

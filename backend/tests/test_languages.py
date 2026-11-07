@@ -121,7 +121,7 @@ def _drain(db, limit=80):
 
 
 @pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL is not set")
-def test_fake_uk_job_reaches_done_and_stores_source(session, tmp_path, make_user):
+def test_fake_uk_job_stores_cyrillic(session, tmp_path, make_user):
     owner = make_user()
     paragraph = "The motor housing is sealed against dust and water during every ride."
     path = tmp_path / "uk.pdf"
@@ -144,7 +144,5 @@ def test_fake_uk_job_reaches_done_and_stores_source(session, tmp_path, make_user
     text_blocks = [block for block in blocks if block.text]
     assert text_blocks
     for block in text_blocks:
-        assert stored[block.idx] == block.text, (
-            "FakeProvider emits [uk] plus the English source. "
-            "The Cyrillic script check drops that output, so the pipeline stores the source."
-        )
+        assert stored[block.idx] != block.text
+        assert any("\u0400" <= char <= "\u04ff" for char in stored[block.idx])

@@ -1,6 +1,6 @@
 # Stark Translator
 
-PDF, DOCX, and page-photo translation. One Python core serves a FastAPI web API and an MCP stdio server. Postgres is the state store and the queue (`FOR UPDATE SKIP LOCKED`). Workers claim work; a restart continues from the last committed segment. Default provider is `PROVIDER=fake`.
+PDF, DOCX, and page-photo translation. One Python core serves a FastAPI web API and an MCP server (Streamable HTTP on :8001; stdio still works). Postgres is the state store and the queue (`FOR UPDATE SKIP LOCKED`). Redis pub/sub carries live progress to a separate realtime service that never touches the database. Workers claim work; a restart continues from the last committed segment. Default provider is `PROVIDER=fake`.
 
 Brand is Stark Future: gold `#CFAC57`, gray `#E0E0E0`, black `#000000`, white `#FFFFFF`. Tokens live in the frontend Tailwind config. Gold is an accent.
 
@@ -17,15 +17,21 @@ Deeper context, read only when the task needs it: `README.md` (run, MCP, accepta
 | `backend/app/core/provider/` | `TranslationProvider`. Factory in `factory.py` |
 | `backend/app/core/ocr/` | `OcrProvider` (`VisionOcrProvider`, `FakeOcrProvider`) |
 | `backend/app/core/analysis/` | Tier 0 `page_classifier`, Tier 1 vision, preprocess |
-| `backend/app/core/agents/` | Review agent and `not_a_document` guardrail |
+| `backend/app/core/agents/` | Review agent (`PROVIDER=openai`) and the plain `ensure_is_document` check |
+| `backend/app/core/events.py` | After-commit Redis publisher. Channel names live in `channels_for` |
 | `backend/app/core/prompts.py` | Prompt text. Bump `PROMPT_VERSION` when a prompt changes |
 | `backend/app/core/errors.py` | `AppError` and provider error types |
 | `backend/app/api/routes.py` | HTTP shell. Routers mounted at `/api` |
+| `backend/app/api/auth_routes.py` | Register, login, logout, tokens, `POST /api/events/ticket` |
+| `backend/app/auth/` | Passwords (argon2), opaque session cookies, API tokens, HMAC tickets |
+| `backend/app/cli.py` | `create-user` and `claim-orphans` |
 | `backend/app/worker.py` | Thread loop: `reap`, `sync_gate`, `process_available` |
-| `backend/app/mcp/` | Four async tools on `ApiClient`. Streamable HTTP on :8001, SSE waits, `wait` flag |
+| `backend/app/mcp/` | Four async tools plus `ApiClient`. HTTP transport on :8001 |
+| `backend/app/realtime/` | SSE relay. No database access |
 | `backend/app/db/models.py` | SQLAlchemy models. Migrations in `backend/alembic/` |
 | `backend/app/config.py` | `Settings` from env. `get_settings()` is cached |
-| `frontend/src/` | `App.tsx` (routes), `api.ts`, `copy.ts` (error strings) |
+| `compose.realtime.yml` | Redis and the realtime service, included by `docker-compose.yml` |
+| `frontend/src/` | `App.tsx` (routes), `api.ts`, `copy.ts` (error strings), `useEventStream.ts` |
 | `scripts/benchmark.py` | Cost and p95 from `provider_calls` |
 
 A new format is one adapter plus an `ADAPTERS` entry plus a sniff branch. Image bytes stay on the files volume (`asset_path`). Blocks with `kind=image` are never sent to a provider.
@@ -44,21 +50,27 @@ During `translating` the unit of work is the **segment**. Claim prefers the job 
 
 Chunking groups blocks up to `segment_budget` (stored on the job as `segment_budget_tokens`). Oversized blocks split on sentence boundaries, then tokens, and are flagged so render rejoins them. Prompts use numbered blocks and require numbered blocks back (`numbered.py`).
 
-Translation memory key is `(src_hash, source_lang, target_lang)`. Hits are model-independent (`source=tm`) and are excluded from the prompt. User edits set `output_stale`; `POST /api/jobs/{id}/render` rebuilds the file.
+Translation memory key is `(owner_id, src_hash, source_lang, target_lang)`. Hits are model-independent (`source=tm`) and are excluded from the prompt. User edits set `output_stale`; `POST /api/jobs/{id}/render` rebuilds the file.
 
-Review (`openai-agents`, `REVIEW_MODEL`) runs only on flagged segments (length ratio, language, glossary, untranslated). Tools: `get_source_segment`, `get_neighbor_translations`, `lookup_glossary`, `retranslate_segment`, `accept_segment`, and `view_source_page_image` for OCR pages. Bulk translation stays a completion. In fake mode the retranslate path is a heuristic.
+Review (`openai-agents`, `REVIEW_MODEL`) runs only when `PROVIDER=openai`, and only on flagged segments (length ratio, language, glossary, untranslated). Tools: `get_source_segment`, `get_neighbor_translations`, `lookup_glossary`, `retranslate_segment`, `accept_segment`, and `view_source_page_image` for OCR pages. Its provider calls use ledger stage `review_agent`. A failure writes a `review_agent_failed` event and the job still finishes on the fake-provider retranslate path. Bulk translation stays a completion. In fake mode the retranslate path is a heuristic. `not_a_document` is a plain check (`ensure_is_document`), not an agent guardrail. `AGENT_TRACE_EXPORTER=otlp` is still a no-op.
 
-OCR and review use `gpt-4o` (`gpt-4o-2024-08-06`). Bulk translation and Tier 1 classification use `gpt-4o-mini` (`gpt-4o-mini-2024-07-18`). Send `max_completion_tokens`. Prices live on the `ModelSpec`. `provider_calls` is the cost ledger; `GET /api/jobs/{id}/cost` must match that table. `MAX_JOB_COST_CENTS` aborts with `cost_cap_exceeded`.
+OCR and review use `gpt-4o` (`gpt-4o-2024-08-06`). Bulk translation and Tier 1 classification use `gpt-4o-mini` (`gpt-4o-mini-2024-07-18`). Send `max_completion_tokens`. Prices live on the `ModelSpec`, including `cached_input_price_per_1m` (half the input price when unset). `estimate_for` prices a job before it runs; `GET /api/documents/{id}/estimate?target_lang=` returns that quote for every model. `provider_calls` is the cost ledger; `GET /api/jobs/{id}/cost` must match that table. Real OCR writes a `provider_calls` row and adds that cost to the job. `MAX_JOB_COST_CENTS` aborts with `cost_cap_exceeded`.
 
-PDF render modes: `reflow` (default) and `layout` (bbox overlay, per-page fallback to reflow). OCR pages always reflow. DOCX writes the translation into the first text run and leaves `w:drawing` runs untouched. PNG/JPEG uploads are one OCR page rendered to PDF.
+PDF render modes: `layout` (default) and `reflow`. Layout paints into the original boxes and falls back to reflow per page. OCR pages always reflow. DOCX writes the translation into the first text run and leaves `w:drawing` runs untouched. DOCX headers and footers are not extracted, so render leaves them unchanged. PNG/JPEG uploads are one OCR page rendered to PDF.
 
 ## API and MCP
 
 Errors are `AppError` → `{code, message, detail, retryable}` with a real status. Add a specific message in `frontend/src/copy.ts` for every new code. Upload codes already in use: `file_too_large`, `invalid_file`, `corrupt_pdf`, `corrupt_file`, `encrypted_pdf`, `unsupported_type`, `empty_document`, `not_a_document`. Job codes: `ocr_no_text`, `provider_timeout`, `provider_error`, `rate_limited`, `cost_cap_exceeded`, `not_ready`, `unknown_language`, `unknown_model`, `cancelled`.
 
-`POST /api/jobs` honors `Idempotency-Key` and returns the existing job. Same sha256 returns the existing document. Uploads stay under `FILES_DIR` (`uploads/`, `assets/`, `thumbs/`). Filename is the basename only.
+`POST /api/jobs` honors `Idempotency-Key` and returns the existing job. The handler commits before the response is sent. Same sha256 returns the existing document for that user. Uploads stay under `FILES_DIR` (`uploads/`, `assets/`, `thumbs/`). The upload limit is `MAX_UPLOAD_MB` (default 40) and the UI reads it from `GET /api/meta/config`. Filename is the basename only.
 
-MCP tools, and only these: `estimate_translation`, `translate_document`, `get_translation_status`, `download_translation`. The server speaks streamable HTTP on port 8001 (`/mcp`) and can still run over stdio. Tools use `ApiClient` only. Waiting follows the realtime SSE stream, with REST polling only if that stream cannot be reached. `translate_document` returns `{job_id, status, document_id}` unless `wait` is true.
+Every document and job route depends on `current_user`. Rows load through `owned(...)`. Another user's id returns 404, the same response as a missing id. Dedupe and translation memory are per user. MCP calls send `Authorization: Bearer stk_…`. Cookie mutations must send `Origin` equal to `PUBLIC_ORIGIN` or they return 403 `csrf_failed`. `npm run dev` on port 5173 must set `PUBLIC_ORIGIN` to that origin. Compose on port 8080 matches the default `http://localhost:8080`.
+
+Env: `AUTH_SECRET` (required when `PROVIDER` is not `fake`), `ALLOW_SIGNUP`, `COOKIE_SECURE`, `PUBLIC_ORIGIN`. `python -m app.cli create-user` adds an account. `python -m app.cli claim-orphans` assigns rows that have no owner.
+
+Realtime contract v2: one channel per user, `user:{owner_id}`. The browser and MCP client obtain an HMAC ticket with `POST /api/events/ticket` and open `GET /events?ticket=`. The realtime process verifies the ticket and subscribes to that user's channel. It does not read Postgres. Messages carry absolute counters (`done_segments`, `total_segments`, `cost_cents`, `status`). A client loads current state over REST, then applies `update` events. `resync` means refetch over REST. A lost message is covered by the next one or by that REST read. There is one EventSource per tab. Nginx and the Vite dev server proxy `/events` with buffering off.
+
+MCP tools, and only these: `estimate_translation`, `translate_document`, `get_translation_status`, `download_translation`. There is no in-process client. Tools build one `ApiClient` and talk HTTP. `TRANSLATOR_API_URL` defaults to `http://127.0.0.1:8000` (compose sets `http://api:8000`). `MCP_WORKSPACE` is the only directory the tools may read or write; paths outside it return `path_outside_workspace`. The server speaks streamable HTTP on port 8001 (`/mcp`) and can still run over stdio. Waiting follows the realtime SSE stream, with REST polling only if that stream cannot be reached. `translate_document` returns `{job_id, status, document_id}` unless `wait` is true. `estimate_translation` calls `GET /api/documents/{id}/estimate?target_lang=` for the requested target language.
 
 `GET /health`, `GET /ready` (DB ping), `GET /metrics` are unprefixed. `GET /api/debug/provider-calls` exists only when `PROVIDER=fake`.
 
@@ -70,13 +82,13 @@ Fake knobs: `FAKE_LATENCY_MS`, `FAKE_FAIL_MODE` (`http500|timeout|rate_limit|unt
 
 Concurrency ceilings: `PROVIDER_MAX_CONCURRENCY` (32), `PROVIDER_TPM_BUDGET` (2_000_000), `JOB_MAX_CONCURRENCY` (16). The gate is a Postgres counter shared by worker replicas. A 429 halves effective concurrency and ramps one slot per quiet minute. `SEGMENT_ATTEMPT_LIMIT` is 3.
 
-`OTEL_EXPORTER=none|otlp` (default `none`). `AGENT_TRACE_EXPORTER` covers the review agent only. Observability containers are the `observability` compose profile.
+`OTEL_EXPORTER=none|otlp` (default `none`) exports API spans when the exporter package is installed. `AGENT_TRACE_EXPORTER` covers the review agent only. `AGENT_TRACE_EXPORTER=otlp` is still a no-op. Observability containers are the `observability` compose profile.
 
 ## Commands
 
 ```bash
 cp .env.example .env
-docker compose up --build          # UI :8080, API :8000, provider from .env
+docker compose up --build          # UI :8080, API :8000, MCP :8001, realtime :8002, Redis
 docker compose --profile observability up
 
 cd backend && uv sync --python 3.12 --extra dev

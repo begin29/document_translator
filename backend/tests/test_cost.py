@@ -126,7 +126,15 @@ def test_cached_tokens_price_uncached_and_cached_input_separately():
 def test_ledger_matches_provider_calls_including_review(session, make_user, tmp_path):
     owner = make_user()
     document = _prepare(session, tmp_path, owner, "ledger.pdf", _lines(220))
-    job = create_job(session, document.id, "uk", None, "gpt-4o-mini", None, f"ledger-{uuid.uuid4()}")
+    job = create_job(
+        session,
+        document.id,
+        "uk",
+        None,
+        "gpt-4o-mini",
+        [{"source": "motor", "target": "двигун"}],
+        f"ledger-{uuid.uuid4()}",
+    )
     session.commit()
     _drain(session)
     session.refresh(job)
@@ -168,11 +176,8 @@ def test_estimate_tracks_translate_tokens_and_segment_count(session, make_user, 
     quote = estimate_for(session, document, "de", "gpt-4o-mini")
     job = create_job(session, document.id, "de", None, "gpt-4o-mini", None, f"estimate-{uuid.uuid4()}")
     session.commit()
-    stored = session.execute(
-        text("SELECT estimate_cents FROM translation_jobs WHERE id = :id"),
-        {"id": job.id},
-    ).scalar()
-    assert Decimal(stored) == quote["cost_cents"]
+    session.refresh(job)
+    assert job.estimate_cents == quote["cost_cents"]
     _drain(session)
     session.refresh(job)
     assert job.status == "done"

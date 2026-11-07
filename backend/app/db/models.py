@@ -107,6 +107,7 @@ class TranslationJob(Base):
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     cost_cents: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=0)
+    estimate_cents: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_path: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -26,7 +26,6 @@ from app.core.service import (
     estimate_for,
     public_estimate,
     render_job,
-    stored_estimates,
 )
 from app.db.models import Block, BlockTranslation, Document, JobEvent, ProviderCall, Segment, TranslationJob, User
 
@@ -39,7 +38,7 @@ class JobIn(BaseModel):
     source_lang: str | None = None
     model: str | None = None
     glossary: list[dict] | None = None
-    render_mode: str = "reflow"
+    render_mode: str = "layout"
 
 
 class EditIn(BaseModel):
@@ -72,10 +71,6 @@ def _document(document: Document) -> dict:
     }
 
 
-def _one_estimate(session: Session, job_id: uuid.UUID):
-    return stored_estimates(session, [job_id]).get(job_id)
-
-
 def _filename(session: Session, document_id: uuid.UUID) -> str | None:
     document = session.get(Document, document_id)
     if document is None:
@@ -83,7 +78,7 @@ def _filename(session: Session, document_id: uuid.UUID) -> str | None:
     return document.filename
 
 
-def _job(job: TranslationJob, filename: str | None = None, estimate_cents=None) -> dict:
+def _job(job: TranslationJob, filename: str | None = None) -> dict:
     return {
         "id": str(job.id),
         "document_id": str(job.document_id),
@@ -104,7 +99,7 @@ def _job(job: TranslationJob, filename: str | None = None, estimate_cents=None) 
         "render_mode": job.render_mode,
         "quality_warning": job.quality_warning,
         "summary": job.summary,
-        "estimate_cents": None if estimate_cents is None else float(estimate_cents),
+        "estimate_cents": None if job.estimate_cents is None else float(job.estimate_cents),
         "created_at": job.created_at.isoformat() if job.created_at else None,
     }
 
@@ -160,7 +155,8 @@ def post_job(
         idempotency_key,
         body.render_mode,
     )
-    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
+    session.commit()
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/documents/{document_id}/estimate")
@@ -191,21 +187,20 @@ def list_jobs(session: Session = Depends(get_session), user: User = Depends(curr
         .order_by(TranslationJob.created_at.desc())
         .limit(100)
     ).all()
-    estimates = stored_estimates(session, [job.id for job, _filename in rows])
-    return [_job(job, filename, estimates.get(job.id)) for job, filename in rows]
+    return [_job(job, filename) for job, filename in rows]
 
 
 @router.get("/jobs/{job_id}")
 def read_job(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     job = owned(session, TranslationJob, job_id, user)
-    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.post("/jobs/{job_id}/cancel")
 def post_cancel(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     owned(session, TranslationJob, job_id, user)
     job = cancel_job(session, job_id)
-    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs/{job_id}/segments")
@@ -265,7 +260,7 @@ def patch_segment(
 def post_render(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     owned(session, TranslationJob, job_id, user)
     job = render_job(session, job_id)
-    return _job(job, _filename(session, job.document_id), _one_estimate(session, job.id))
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs/{job_id}/download")

@@ -91,12 +91,19 @@ class FakeProvider:
             match = re.match(r"^\[(\d+)\]\s*(.*)$", line)
             if match:
                 matched = True
-                lines.append(f"[{match.group(1)}] [{lang}] {match.group(2)}")
+                lines.append(f"[{match.group(1)}] {_tagged(lang, match.group(2))}")
             elif line.strip():
-                lines.append(f"[{lang}] {line}")
+                lines.append(_tagged(lang, line))
         if not matched:
-            return f"[{lang}] {request.user}"
+            return _tagged(lang, request.user)
         return "\n".join(lines)
+
+
+def _tagged(lang: str, text: str) -> str:
+    body = text
+    if lang.lower() == "uk":
+        body = f"{text} Переклад"
+    return f"[{lang}] {body}"
 
 
 def _segments(raw: str) -> set[int]:
