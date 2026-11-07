@@ -75,10 +75,18 @@ def _document(document: Document) -> dict:
     }
 
 
-def _job(job: TranslationJob) -> dict:
+def _filename(session: Session, document_id: uuid.UUID) -> str | None:
+    document = session.get(Document, document_id)
+    if document is None:
+        return None
+    return document.filename
+
+
+def _job(job: TranslationJob, filename: str | None = None) -> dict:
     return {
         "id": str(job.id),
         "document_id": str(job.document_id),
+        "document_filename": filename,
         "source_lang": job.source_lang,
         "target_lang": job.target_lang,
         "model": job.model,
@@ -101,6 +109,15 @@ def _job(job: TranslationJob) -> dict:
 
 @router.post("/documents")
 async def upload_document(file: UploadFile = File(...), session: Session = Depends(get_session)):
+    settings = get_settings()
+    if file.size is not None and file.size > settings.max_upload_bytes:
+        raise AppError(
+            "file_too_large",
+            f"This file is {file.size} bytes, above the {settings.max_upload_mb} MB limit.",
+            str(file.size),
+            False,
+            413,
+        )
     data = await file.read()
     document = create_document(session, file.filename or "upload", data)
     return _document(document)
@@ -136,13 +153,18 @@ def post_job(
         idempotency_key,
         body.render_mode,
     )
-    return _job(job)
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs")
 def list_jobs(session: Session = Depends(get_session)):
-    rows = session.scalars(select(TranslationJob).order_by(TranslationJob.created_at.desc()).limit(100)).all()
-    return [_job(row) for row in rows]
+    rows = session.execute(
+        select(TranslationJob, Document.filename)
+        .join(Document, Document.id == TranslationJob.document_id)
+        .order_by(TranslationJob.created_at.desc())
+        .limit(100)
+    ).all()
+    return [_job(job, filename) for job, filename in rows]
 
 
 @router.get("/jobs/{job_id}")
@@ -150,12 +172,13 @@ def read_job(job_id: uuid.UUID, session: Session = Depends(get_session)):
     job = session.get(TranslationJob, job_id)
     if job is None:
         raise AppError("not_found", "Job not found.", str(job_id), False, 404)
-    return _job(job)
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.post("/jobs/{job_id}/cancel")
 def post_cancel(job_id: uuid.UUID, session: Session = Depends(get_session)):
-    return _job(cancel_job(session, job_id))
+    job = cancel_job(session, job_id)
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs/{job_id}/segments")
@@ -208,7 +231,8 @@ def patch_segment(job_id: uuid.UUID, segment_idx: int, body: EditIn, session: Se
 
 @router.post("/jobs/{job_id}/render")
 def post_render(job_id: uuid.UUID, session: Session = Depends(get_session)):
-    return _job(render_job(session, job_id))
+    job = render_job(session, job_id)
+    return _job(job, _filename(session, job.document_id))
 
 
 @router.get("/jobs/{job_id}/download")
@@ -252,6 +276,11 @@ def stats(since_hours: int = 24, session: Session = Depends(get_session)):
 @router.get("/meta/languages")
 def languages():
     return LANGUAGES
+
+
+@router.get("/meta/config")
+def meta_config():
+    return {"max_upload_mb": get_settings().max_upload_mb}
 
 
 @router.get("/meta/models")

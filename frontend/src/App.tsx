@@ -1,7 +1,42 @@
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
-import { api, DocumentRecord, JobRecord, SegmentRecord } from "./api";
+import { ApiError, DocumentRecord, JobRecord, SegmentRecord, request } from "./api";
 import { errorMessage, progressLabel } from "./copy";
+import { applySnapshot, isTerminal, mergeState, useEventStream } from "./useEventStream";
+
+const rememberedJobs = new Map<string, JobRecord>();
+const DETAIL_STATUSES = new Set(["translating", "reviewing", "rendering", "done", "failed"]);
+
+type CostReport = {
+  stages: { stage: string; cost_cents: number; tokens_in: number; tokens_out: number }[];
+};
+
+function adoptJobs(prev: Map<string, JobRecord>, rows: JobRecord[]): Map<string, JobRecord> {
+  const next = new Map<string, JobRecord>();
+  for (const row of rows) {
+    next.set(row.id, applySnapshot(prev.get(row.id) ?? rememberedJobs.get(row.id), row, "job"));
+  }
+  rememberedJobs.clear();
+  for (const job of next.values()) rememberedJobs.set(job.id, job);
+  return next;
+}
+
+function rememberJob(job: JobRecord) {
+  rememberedJobs.set(job.id, job);
+}
+
+function formatStamp(value: string | null | undefined): string {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toLocaleString();
+}
+
+function readFailure(err: unknown): { code?: string; detail?: string } {
+  if (err instanceof ApiError) return { code: err.code, detail: err.message };
+  if (err instanceof Error) return { detail: err.message };
+  return { detail: "The request did not complete." };
+}
 
 function Shell({ children }: { children: ReactNode }) {
   return (
@@ -24,10 +59,13 @@ function Shell({ children }: { children: ReactNode }) {
 
 function ErrorPanel({ code, detail }: { code?: string | null; detail?: string | null }) {
   if (!code && !detail) return null;
+  const message = errorMessage(code, detail);
+  const extra = detail && detail !== message ? detail : null;
   return (
     <div className="border border-stark-gold/60 bg-stark-ink px-4 py-3 text-sm text-stark-gold" role="alert">
       <div className="text-xs uppercase tracking-[0.18em]">Needs attention</div>
-      <p className="mt-1 text-stark-white">{errorMessage(code, detail)}</p>
+      <p className="mt-1 text-stark-white">{message}</p>
+      {extra && <p className="mt-1 text-stark-gray">{extra}</p>}
       {code && <p className="mt-1 font-mono text-xs text-stark-gray">{code}</p>}
     </div>
   );
@@ -35,21 +73,76 @@ function ErrorPanel({ code, detail }: { code?: string | null; detail?: string | 
 
 function Home() {
   const navigate = useNavigate();
-  const [jobs, setJobs] = useState<JobRecord[]>([]);
+  const [jobs, setJobs] = useState<Map<string, JobRecord>>(() => new Map(rememberedJobs));
+  const [maxUploadMb, setMaxUploadMb] = useState<number | null>(null);
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const mounted = useRef(true);
+  const liveJobIds = [...jobs.values()].filter((job) => !isTerminal("job", job.status)).map((job) => job.id);
 
   useEffect(() => {
-    api<JobRecord[]>("/api/jobs").then(setJobs).catch(() => setJobs([]));
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
   }, []);
+
+  useEffect(() => {
+    let stop = false;
+    request<{ max_upload_mb: number }>("/api/meta/config")
+      .then((config) => {
+        if (!stop) setMaxUploadMb(config.max_upload_mb);
+      })
+      .catch(() => {
+        if (!stop) setMaxUploadMb(null);
+      });
+    return () => {
+      stop = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let stop = false;
+    request<JobRecord[]>("/api/jobs")
+      .then((rows) => {
+        if (!stop) setJobs((prev) => adoptJobs(prev, rows));
+      })
+      .catch(() => undefined);
+    return () => {
+      stop = true;
+    };
+  }, []);
+
+  useEventStream(
+    { jobs: liveJobIds, documents: [] },
+    {
+      fetchState: async () => {
+        const rows = await request<JobRecord[]>("/api/jobs");
+        if (!mounted.current) return;
+        setJobs((prev) => adoptJobs(prev, rows));
+      },
+      onMessage: (msg) => {
+        if (msg.type !== "job") return;
+        setJobs((prev) => {
+          const existing = prev.get(msg.id);
+          if (!existing) return prev;
+          const next = new Map(prev);
+          const merged = mergeState(existing, msg);
+          next.set(msg.id, merged);
+          rememberedJobs.set(msg.id, merged);
+          return next;
+        });
+      },
+    },
+  );
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const input = event.currentTarget.elements.namedItem("file") as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
-    if (file.size > 40 * 1024 * 1024) {
-      setError({ code: "file_too_large", detail: "Client limit is 40 MB." });
+    if (maxUploadMb != null && file.size > maxUploadMb * 1024 * 1024) {
+      setError({ code: "file_too_large", detail: `Limit is ${maxUploadMb} MB.` });
       return;
     }
     setBusy(true);
@@ -57,16 +150,16 @@ function Home() {
     try {
       const body = new FormData();
       body.append("file", file);
-      const document = await api<DocumentRecord>("/api/documents", { method: "POST", body });
+      const document = await request<DocumentRecord>("/api/documents", { method: "POST", body });
       navigate(`/documents/${document.id}`);
     } catch (err) {
-      const known = err as Error & { code?: string; detail?: string };
-      setError({ code: known.code, detail: known.message });
+      setError(readFailure(err));
     } finally {
       setBusy(false);
     }
   }
 
+  const history = [...jobs.values()];
   return (
     <Shell>
       <p className="text-xs uppercase tracking-[0.28em] text-stark-gold">Document translator</p>
@@ -84,13 +177,22 @@ function Home() {
       </form>
       <h2 className="mt-12 text-xs uppercase tracking-[0.22em] text-stark-gray">History</h2>
       <ul className="mt-4 divide-y divide-white/10 border border-white/10">
-        {jobs.length === 0 && <li className="px-4 py-6 text-sm text-stark-gray">No translations yet.</li>}
-        {jobs.map((job) => (
-          <li key={job.id} className="flex items-center justify-between px-4 py-3 text-sm">
-            <Link to={`/jobs/${job.id}`} className="hover:text-stark-gold">{job.target_lang.toUpperCase()} · {job.model}</Link>
-            <span className="text-stark-gray">{job.status}</span>
-          </li>
-        ))}
+        {history.length === 0 && <li className="px-4 py-6 text-sm text-stark-gray">No translations yet.</li>}
+        {history.map((job) => {
+          const stamp = formatStamp(job.created_at);
+          const title = job.document_filename || "Untitled document";
+          return (
+            <li key={job.id} className="flex items-center justify-between gap-4 px-4 py-3 text-sm">
+              <div className="min-w-0">
+                <Link to={`/jobs/${job.id}`} title={title} className="block truncate hover:text-stark-gold">{title}</Link>
+                <p className="mt-1 truncate text-stark-gray">
+                  {job.target_lang.toUpperCase()} · {job.model}{stamp ? ` · ${stamp}` : ""}
+                </p>
+              </div>
+              <span className="shrink-0 text-stark-gray">{job.status}</span>
+            </li>
+          );
+        })}
       </ul>
     </Shell>
   );
@@ -105,40 +207,57 @@ function DocumentPage() {
   const [mode, setMode] = useState("reflow");
   const [languages, setLanguages] = useState<{ code: string; name: string }[]>([]);
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
+  const idRef = useRef(id);
+  idRef.current = id;
+  const documentIds = id && !isTerminal("document", document?.analysis_status) ? [id] : [];
 
   useEffect(() => {
-    api<{ code: string; name: string }[]>("/api/meta/languages").then(setLanguages).catch(() => setLanguages([]));
+    request<{ code: string; name: string }[]>("/api/meta/languages").then(setLanguages).catch(() => setLanguages([]));
   }, []);
 
   useEffect(() => {
-    let stop = false;
-    async function poll() {
-      while (!stop) {
-        const next = await api<DocumentRecord>(`/api/documents/${id}`);
-        if (stop) return;
-        setDocument(next);
-        if (next.analysis_status === "ready" || next.analysis_status === "failed") return;
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-    poll().catch((err: Error & { code?: string }) => setError({ code: err.code, detail: err.message }));
-    return () => {
-      stop = true;
-    };
+    setDocument(null);
+    setError(null);
   }, [id]);
+
+  async function refreshDocument() {
+    const documentId = idRef.current;
+    if (!documentId) return;
+    try {
+      const next = await request<DocumentRecord>(`/api/documents/${documentId}`);
+      if (idRef.current !== documentId) return;
+      setDocument((current) => applySnapshot(current ?? undefined, next, "document"));
+      setError(null);
+    } catch (err) {
+      if (idRef.current !== documentId) return;
+      setError(readFailure(err));
+    }
+  }
+
+  useEventStream(
+    { jobs: [], documents: documentIds },
+    {
+      fetchState: refreshDocument,
+      onMessage: (msg) => {
+        if (msg.type !== "document" || msg.id !== idRef.current) return;
+        setDocument((current) => (current ? mergeState(current, msg) : current));
+        if (isTerminal("document", msg.analysis_status)) void refreshDocument();
+      },
+    },
+  );
 
   async function translate() {
     setError(null);
     try {
-      const job = await api<JobRecord>("/api/jobs", {
+      const job = await request<JobRecord>("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
         body: JSON.stringify({ document_id: id, target_lang: target, model, render_mode: mode }),
       });
+      rememberJob(job);
       navigate(`/jobs/${job.id}`);
     } catch (err) {
-      const known = err as Error & { code?: string };
-      setError({ code: known.code, detail: known.message });
+      setError(readFailure(err));
     }
   }
 
@@ -152,6 +271,7 @@ function DocumentPage() {
         <p className="mt-6 text-stark-gray">Reading pages and classifying each one.</p>
       )}
       {document?.analysis_status === "failed" && <div className="mt-6"><ErrorPanel code={document.error_code} detail={document.error_detail} /></div>}
+      {error && <div className="mt-6"><ErrorPanel code={error.code} detail={error.detail} /></div>}
       {document?.analysis_status === "ready" && document.analysis && (
         <div className="mt-8 grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
           <section className="border border-white/10 p-5">
@@ -210,7 +330,6 @@ function DocumentPage() {
               </select>
             </label>
             <button onClick={translate} className="mt-5 bg-stark-gold px-5 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-black">Translate</button>
-            {error && <div className="mt-4"><ErrorPanel code={error.code} detail={error.detail} /></div>}
           </section>
         </div>
       )}
@@ -222,43 +341,97 @@ function JobPage() {
   const { id } = useParams();
   const [job, setJob] = useState<JobRecord | null>(null);
   const [segments, setSegments] = useState<SegmentRecord[]>([]);
-  const [cost, setCost] = useState<{ stages: { stage: string; cost_cents: number; tokens_in: number; tokens_out: number }[] } | null>(null);
+  const [cost, setCost] = useState<CostReport | null>(null);
   const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const idRef = useRef(id);
+  idRef.current = id;
+  const jobRef = useRef(job);
+  jobRef.current = job;
+  const detailTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const jobIds = id && !isTerminal("job", job?.status) ? [id] : [];
 
   useEffect(() => {
-    let stop = false;
-    async function poll() {
-      while (!stop) {
-        const next = await api<JobRecord>(`/api/jobs/${id}`);
-        if (stop) return;
-        setJob(next);
-        if (["translating", "reviewing", "rendering", "done", "failed"].includes(next.status)) {
-          setSegments(await api<SegmentRecord[]>(`/api/jobs/${id}/segments`));
-          setCost(await api(`/api/jobs/${id}/cost`));
-        }
-        if (["done", "failed", "cancelled"].includes(next.status)) return;
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-    poll().catch(() => undefined);
+    setJob(null);
+    setSegments([]);
+    setCost(null);
+    setDrafts({});
+  }, [id]);
+
+  useEffect(() => {
     return () => {
-      stop = true;
+      if (detailTimer.current) clearTimeout(detailTimer.current);
     };
   }, [id]);
 
+  async function loadDetails(jobId: string, status: string) {
+    if (!DETAIL_STATUSES.has(status)) return;
+    const [nextSegments, nextCost] = await Promise.all([
+      request<SegmentRecord[]>(`/api/jobs/${jobId}/segments`),
+      request<CostReport>(`/api/jobs/${jobId}/cost`),
+    ]);
+    if (idRef.current !== jobId) return;
+    setSegments(nextSegments);
+    setCost(nextCost);
+  }
+
+  async function refreshJob() {
+    const jobId = idRef.current;
+    if (!jobId) return;
+    const next = await request<JobRecord>(`/api/jobs/${jobId}`);
+    if (idRef.current !== jobId) return;
+    setJob((current) => applySnapshot(current ?? undefined, next, "job"));
+    await loadDetails(jobId, next.status);
+  }
+
+  function scheduleDetails() {
+    if (detailTimer.current) clearTimeout(detailTimer.current);
+    detailTimer.current = setTimeout(() => {
+      detailTimer.current = null;
+      const current = jobRef.current;
+      const jobId = idRef.current;
+      if (!current || !jobId) return;
+      void loadDetails(jobId, current.status);
+    }, 1000);
+  }
+
+  useEventStream(
+    { jobs: jobIds, documents: [] },
+    {
+      fetchState: refreshJob,
+      onMessage: (msg) => {
+        if (msg.type !== "job" || msg.id !== idRef.current) return;
+        setJob((current) => (current ? mergeState(current, msg) : current));
+        if (isTerminal("job", msg.status)) {
+          if (detailTimer.current) {
+            clearTimeout(detailTimer.current);
+            detailTimer.current = null;
+          }
+          void refreshJob();
+          return;
+        }
+        scheduleDetails();
+      },
+    },
+  );
+
   async function save(blockIdx: number) {
-    await api(`/api/jobs/${id}/segments/0`, {
+    await request(`/api/jobs/${id}/segments/0`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ block_idx: blockIdx, text: drafts[blockIdx] }),
     });
-    setSegments(await api<SegmentRecord[]>(`/api/jobs/${id}/segments`));
+    setSegments(await request<SegmentRecord[]>(`/api/jobs/${id}/segments`));
   }
 
   const ratio = job && job.total_segments ? Math.round((job.done_segments / job.total_segments) * 100) : job?.status === "done" ? 100 : 8;
   return (
     <Shell>
-      <p className="text-xs uppercase tracking-[0.22em] text-stark-gold">{job ? progressLabel(job.done_segments, job.total_segments, job.status) : "Loading"}</p>
+      {job?.document_filename && (
+        <h1 className="truncate text-2xl font-semibold" title={job.document_filename}>{job.document_filename}</h1>
+      )}
+      <p className={`${job?.document_filename ? "mt-2" : ""} text-xs uppercase tracking-[0.22em] text-stark-gold`}>
+        {job ? progressLabel(job.done_segments, job.total_segments, job.status) : "Loading"}
+      </p>
       <div className="mt-4 h-1 bg-white/10">
         <div className="h-1 bg-stark-gold" style={{ width: `${Math.min(ratio, 100)}%` }} />
       </div>
@@ -305,12 +478,18 @@ function JobPage() {
   );
 }
 
+const routes: { path: string; element: ReactNode }[] = [
+  { path: "/", element: <Home /> },
+  { path: "/documents/:id", element: <DocumentPage /> },
+  { path: "/jobs/:id", element: <JobPage /> },
+];
+
 export function App() {
   return (
     <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/documents/:id" element={<DocumentPage />} />
-      <Route path="/jobs/:id" element={<JobPage />} />
+      {routes.map((route) => (
+        <Route key={route.path} path={route.path} element={route.element} />
+      ))}
     </Routes>
   );
 }
