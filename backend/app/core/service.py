@@ -121,21 +121,9 @@ def run_analysis(session: Session, document_id: uuid.UUID) -> None:
             adapter = adapter_for(document.format)
             extracted = adapter.extract(Path(document.storage_path), Path(settings.files_dir))
             _apply_tier1(session, document, extracted)
-            classes = [page.page_class for page in extracted.pages]
-            from app.core.agents.document_guardrail import not_a_document_guardrail, pages_are_not_a_document
+            from app.core.agents.document_guardrail import ensure_is_document
 
-            if pages_are_not_a_document(classes):
-                verdict = not_a_document_guardrail.guardrail_function(
-                    None,
-                    None,
-                    "non_document:" + ",".join(str(page.page) for page in extracted.pages),
-                )
-                if verdict.tripwire_triggered:
-                    raise AppError(
-                        "not_a_document",
-                        "No readable document content was found. Pages look like photos or graphics without text.",
-                        "pages=" + ",".join(str(page.page) for page in extracted.pages),
-                    )
+            ensure_is_document(extracted.pages)
             session.query(Block).filter(Block.document_id == document.id).delete()
             ordered = sorted(extracted.blocks, key=lambda block: (block.page, block.seq))
             for position, block in enumerate(ordered):

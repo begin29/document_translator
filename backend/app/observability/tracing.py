@@ -43,7 +43,13 @@ def span(name: str, **attributes):
 
 def configure_agent_tracing() -> None:
     settings = get_settings()
-    if settings.agent_trace_exporter == "langsmith":
+    exporter = settings.agent_trace_exporter
+    if exporter == "none" or (exporter == "openai" and not settings.openai_api_key):
+        from agents import set_tracing_disabled
+
+        set_tracing_disabled(True)
+        return
+    if exporter == "langsmith":
         try:
             from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
             from agents import set_trace_processors
@@ -51,5 +57,6 @@ def configure_agent_tracing() -> None:
             set_trace_processors([OpenAIAgentsTracingProcessor()])
         except Exception:
             return
-    if settings.agent_trace_exporter == "otlp":
+        return
+    if exporter == "otlp":
         return
