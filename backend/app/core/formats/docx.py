@@ -140,20 +140,57 @@ def _drawing_blob(run) -> bytes | None:
     return part.blob
 
 
+def _field_kind(run) -> str | None:
+    nodes = run._element.xpath("./w:fldChar | .//w:fldChar")
+    if not nodes:
+        return None
+    return nodes[0].get(qn("w:fldCharType"))
+
+
+def _editable_runs(paragraph) -> list:
+    editable = []
+    in_field = False
+    for run in paragraph.runs:
+        element = run._element
+        parent = element.getparent()
+        if parent is not None and parent.tag == qn("w:hyperlink"):
+            continue
+        if element.xpath("ancestor::w:hyperlink") or element.xpath("ancestor::w:fldSimple"):
+            continue
+        kind = _field_kind(run)
+        if kind == "begin":
+            in_field = True
+            continue
+        if kind == "end":
+            in_field = False
+            continue
+        if kind is not None or in_field:
+            continue
+        if element.xpath(".//w:instrText") or element.xpath(".//w:fldSimple"):
+            continue
+        if _has_drawing(run):
+            continue
+        editable.append(run)
+    return editable
+
+
 def _replace_paragraph(paragraph, text: str) -> None:
-    text_runs = [run for run in paragraph.runs if not _has_drawing(run)]
-    if not text_runs:
+    runs = _editable_runs(paragraph)
+    if not runs:
         return
-    text_runs[0].text = text
-    for run in text_runs[1:]:
-        run.text = ""
+    carrier = max(runs, key=lambda run: len(run.text or ""))
+    for run in runs:
+        run.text = text if run is carrier else ""
 
 
 def _replace_cell(cell, text: str) -> None:
-    if not cell.paragraphs:
+    paragraphs = list(cell.paragraphs)
+    if not paragraphs:
         return
-    _replace_paragraph(cell.paragraphs[0], text)
-    for paragraph in cell.paragraphs[1:]:
-        text_runs = [run for run in paragraph.runs if not _has_drawing(run)]
-        for run in text_runs:
-            run.text = ""
+
+    def weight(paragraph) -> int:
+        return sum(len(run.text or "") for run in _editable_runs(paragraph))
+
+    host = max(paragraphs, key=weight)
+    for paragraph in paragraphs:
+        _replace_paragraph(paragraph, text if paragraph is host else "")
