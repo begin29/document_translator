@@ -40,8 +40,16 @@ class OpenAIProvider:
             raise RuntimeError("OpenAIProvider cannot be constructed when APP_ENV=test")
         if not settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is required when PROVIDER=openai")
-        from openai import OpenAI
+        from app.observability.tracing import langfuse_enabled
 
+        if langfuse_enabled(settings):
+            from langfuse.openai import OpenAI
+
+            self._traced = True
+        else:
+            from openai import OpenAI
+
+            self._traced = False
         self.client = OpenAI(api_key=settings.openai_api_key, timeout=90, max_retries=0)
 
     def count_tokens(self, text: str, model: str | None = None) -> int:
@@ -74,6 +82,10 @@ class OpenAIProvider:
         }
         if request.json_mode and not request.images:
             payload["response_format"] = {"type": "json_object"}
+        if self._traced:
+            from app.observability.tracing import generation_name
+
+            payload["name"] = generation_name(request.stage)
         started = time.perf_counter()
         try:
             response = self.client.chat.completions.create(**payload)

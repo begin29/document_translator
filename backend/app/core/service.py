@@ -122,7 +122,14 @@ def run_analysis(session: Session, document_id: uuid.UUID) -> None:
     logger = log.bind(job_id=None, stage="analyze", document_id=str(document_id))
     logger.info("analysis_started")
     try:
-        with span("analyze", document_id=str(document_id)):
+        with span(
+            "analyze-document",
+            trace_id=str(document.id),
+            user_id=str(document.owner_id) if document.owner_id else None,
+            session_id=str(document.id),
+            tags=["analyze"],
+            observation_input={"filename": document.filename, "format": document.format},
+        ) as current:
             adapter = adapter_for(document.format)
             extracted = adapter.extract(Path(document.storage_path), Path(settings.files_dir))
             _apply_tier1(session, document, extracted)
@@ -144,6 +151,8 @@ def run_analysis(session: Session, document_id: uuid.UUID) -> None:
             document.error_code = None
             document.error_detail = None
             _publish_document(session, document)
+            if current is not None:
+                current.update(output={"pages": extracted.page_count, "blocks": len(ordered), "source_lang": extracted.detected_source_lang})
             logger.info("analysis_ready", pages=extracted.page_count, blocks=len(ordered))
     except AppError as exc:
         document.analysis_status = "failed"
@@ -776,8 +785,18 @@ def _ocr_page(session: Session, job_id: uuid.UUID, page_no: int, worker_id: str)
         image = to_png(enhanced)
     started = time.perf_counter()
     try:
-        with span("ocr_page", job_id=str(job_id), page=page_no):
+        with span(
+            "ocr-page",
+            trace_id=str(job.id),
+            user_id=str(job.owner_id) if job.owner_id else None,
+            session_id=str(job.document_id),
+            tags=["ocr", job.target_lang] if job.target_lang else ["ocr"],
+            observation_input={"page": page_no},
+            page=page_no,
+        ) as current:
             result = _ocr().transcribe(image or b"", job.source_lang or "")
+            if current is not None:
+                current.update(output={"blocks": len(result.blocks)})
     except AppError as exc:
         _record(stage="ocr", model=get_settings().ocr_model, tokens_in=0, tokens_out=0, tokens_cached=0, latency_ms=0, status="error", error_code=exc.code, attempt=1, job_id=job.id, page_no=page_no)
         _fail(session, job, exc.code, exc.message)
@@ -995,8 +1014,19 @@ def _translate_segment(session: Session, segment_id: uuid.UUID, worker_id: str) 
     )
     started = time.perf_counter()
     try:
-        with span("translate_segment", job_id=str(job.id), segment=segment.idx):
+        with span(
+            "translate-segment",
+            trace_id=str(job.id),
+            user_id=str(job.owner_id) if job.owner_id else None,
+            session_id=str(job.document_id),
+            tags=["translate", job.target_lang] if job.target_lang else ["translate"],
+            observation_input={"segment": segment.idx, "source": [text for _, text in pairs]},
+            segment=segment.idx,
+            model=spec.alias,
+        ) as current:
             result = _call_with_retries(session, request)
+            if current is not None:
+                current.update(output=result.text)
     except InjectedCrash:
         raise
     except AppError as exc:
@@ -1091,8 +1121,17 @@ def _review_job(session: Session, job_id: uuid.UUID, worker_id: str) -> None:
     job = session.get(TranslationJob, job_id)
     logger = log.bind(job_id=str(job_id), stage="review", worker_id=worker_id)
     try:
-        with span("review_segment", job_id=str(job_id)):
+        with span(
+            "review-job",
+            trace_id=str(job.id),
+            user_id=str(job.owner_id) if job.owner_id else None,
+            session_id=str(job.document_id),
+            tags=["review", job.target_lang] if job.target_lang else ["review"],
+            observation_input={"target_lang": job.target_lang, "source_lang": job.source_lang},
+        ) as current:
             warning = review_job(session, job, _provider())
+            if current is not None:
+                current.update(output={"quality_warning": bool(warning)})
     except AppError as exc:
         _fail(session, job, exc.code, exc.message)
         logger.info("review_failed", error_code=exc.code)
@@ -1128,8 +1167,17 @@ def _claim_render(session: Session, worker_id: str) -> bool:
     session.commit()
     job = session.get(TranslationJob, row.id)
     try:
-        with span("render", job_id=str(job.id)):
+        with span(
+            "render-document",
+            trace_id=str(job.id),
+            user_id=str(job.owner_id) if job.owner_id else None,
+            session_id=str(job.document_id),
+            tags=["render", job.target_lang] if job.target_lang else ["render"],
+            observation_input={"render_mode": job.render_mode},
+        ) as current:
             _render(session, job)
+            if current is not None:
+                current.update(output={"status": "done"})
         job.status = "done"
         job.output_stale = False
         job.locked_by = None
@@ -1260,7 +1308,17 @@ def _ensure_summary(session: Session, job: TranslationJob, document: Document) -
         job.summary = excerpt[:400]
         return True
     try:
-        result = _call_with_retries(session, request)
+        with span(
+            "summarize-document",
+            trace_id=str(job.id),
+            user_id=str(job.owner_id) if job.owner_id else None,
+            session_id=str(job.document_id),
+            tags=["summary", job.target_lang] if job.target_lang else ["summary"],
+            observation_input={"excerpt": excerpt[:500]},
+        ) as current:
+            result = _call_with_retries(session, request)
+            if current is not None:
+                current.update(output=result.text[:1200])
         job.summary = result.text[:1200]
         _add_cost(session, job, request.model, result.tokens_in, result.tokens_out, result.recorded_cents)
     except FundsExceeded as exc:

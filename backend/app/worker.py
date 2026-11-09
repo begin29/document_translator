@@ -9,7 +9,7 @@ from app.core.service import process_available, reap, sync_gate
 from app.db.session import session_factory
 from app.observability.logging import configure_logging, get_logger
 from app.observability.metrics import HEARTBEAT
-from app.observability.tracing import configure_agent_tracing, configure_tracing
+from app.observability.tracing import configure_agent_tracing, configure_tracing, flush_tracing
 
 log = get_logger()
 
@@ -52,6 +52,7 @@ def main() -> None:
             time.sleep(3600)
     except KeyboardInterrupt:
         stop.set()
+        flush_tracing()
 
 
 if __name__ == "__main__":

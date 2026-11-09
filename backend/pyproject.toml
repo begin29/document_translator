@@ -32,6 +32,8 @@ dependencies = [
   "uvloop",
   "argon2-cffi>=23.1",
   "email-validator>=2.2",
+  "langfuse>=5.2.0",
+  "openinference-instrumentation-openai-agents>=2.7.1",
 ]
 
 [project.optional-dependencies]

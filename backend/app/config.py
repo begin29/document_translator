@@ -32,7 +32,11 @@ class Settings(BaseSettings):
     fake_fail_rate: float = 1
     crash_after_segment: int = 0
     otel_exporter: str = "none"
-    otel_endpoint: str = "http://langfuse:4318/v1/traces"
+    otel_endpoint: str = "http://langfuse:3000/api/public/otel/v1/traces"
+    otel_exporter_otlp_headers: str = ""
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = ""
     agent_trace_exporter: str = "openai"
     cors_origins: str = "*"
     redis_url: str = ""

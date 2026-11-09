@@ -8,10 +8,10 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /uvx /bin/
 
 WORKDIR /app
 COPY backend/pyproject.toml ./
-RUN uv sync --no-dev --no-install-project
+RUN uv sync --no-dev --extra otel --no-install-project
 COPY backend/ ./
 COPY models.yaml /app/models.yaml
-RUN uv sync --no-dev --no-install-project
+RUN uv sync --no-dev --extra otel --no-install-project
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

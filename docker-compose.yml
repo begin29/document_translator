@@ -10,8 +10,12 @@ services:
       POSTGRES_DB: translator
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./ops/postgres/entrypoint.sh:/entrypoint.sh:ro
+    ports:
+      - "5434:5432"
+    entrypoint: ["sh", "/entrypoint.sh"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U translator -d translator"]
+      test: ["CMD-SHELL", "pg_isready -U translator -d translator && psql -U translator -d translator -tAc \"SELECT 1 FROM pg_database WHERE datname = 'langfuse_v4'\" | grep -q 1"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -25,6 +29,7 @@ services:
       DATABASE_URL: postgresql+psycopg://translator:translator@db:5432/translator
       FILES_DIR: /data
       MODELS_CONFIG: /app/models.yaml
+      LANGFUSE_BASE_URL: http://langfuse:3000
     volumes:
       - files:/data
     ports:
@@ -43,6 +48,7 @@ services:
       DATABASE_URL: postgresql+psycopg://translator:translator@db:5432/translator
       FILES_DIR: /data
       MODELS_CONFIG: /app/models.yaml
+      LANGFUSE_BASE_URL: http://langfuse:3000
     volumes:
       - files:/data
     depends_on:
@@ -94,21 +100,112 @@ services:
     depends_on:
       - prometheus
 
-  langfuse:
-    image: langfuse/langfuse:2
+  langfuse-redis:
+    image: redis:7-alpine
     profiles: ["observability"]
+    command: ["redis-server", "--requirepass", "langfuse", "--maxmemory-policy", "noeviction", "--save", "", "--appendonly", "no"]
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=langfuse redis-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3.62.3
+    profiles: ["observability"]
+    user: "101:101"
     environment:
-      DATABASE_URL: postgresql://translator:translator@db:5432/translator
-      NEXTAUTH_SECRET: dev-only-change-me
-      SALT: dev-only-salt
-      NEXTAUTH_URL: http://localhost:3001
-      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    profiles: ["observability"]
+    entrypoint: ["sh", "-c"]
+    command: ["mkdir -p /data/langfuse && minio server --address :9000 --console-address :9001 /data"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
     ports:
-      - "3001:3000"
-    depends_on:
+      - "9092:9000"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4.76
+    profiles: ["observability"]
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3001
+      DATABASE_URL: postgresql://translator:translator@db:5432/langfuse_v4
+      SALT: dev-only-salt
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+    depends_on: &langfuse-depends
       db:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  langfuse:
+    image: langfuse/langfuse:4.76
+    profiles: ["observability"]
+    ports:
+      - "3001:3000"
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: dev-only-change-me
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9092
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+    depends_on: *langfuse-depends
 
 volumes:
   pgdata:
   files:
+  langfuse_redis_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
