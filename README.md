@@ -85,13 +85,28 @@ npm run build
 
 ## MCP
 
-The MCP server starts with the stack on port 8001 (`/mcp`). It is Streamable HTTP. Tools call the API over HTTP. There is no in-process client.
+The MCP server starts with the stack on port 8001 (`/mcp`). It is Streamable HTTP. The four tools call the API over HTTP. There is no in-process client.
 
-Set `MCP_WORKSPACE` in `.env` to the absolute host folder that holds your documents. Compose mounts that same path into the MCP container. The server only reads and writes paths inside it. Each person uses their own API token. A request without `Authorization: Bearer stk_…` returns `unauthorized`.
+Set `MCP_WORKSPACE` in `.env` to the absolute host folder that holds the files you will pass in. Compose bind-mounts that folder into the MCP container at the same path, so the `path` you send is the path on your machine. Leave it empty and the server uses `/tmp/stark-translator`. A path outside the folder returns `path_outside_workspace`. After you change `MCP_WORKSPACE`, recreate the service so the mount updates:
 
-`estimate_translation` prices the requested target language. `translate_document` returns `{job_id, status, document_id}` immediately. Pass `wait=true` to follow progress and download in the same call. Progress comes from `GET /events?ticket=`. If that stream cannot be reached, the client polls REST.
+```bash
+docker compose up -d --force-recreate mcp
+```
 
-Cursor config:
+Each person uses their own API token. Put it in the client config below, and do not commit it. A request without `Authorization: Bearer stk_…` returns `unauthorized`. The HTTP server reads that header on every call. Stdio has no header, so it reads `TRANSLATOR_API_TOKEN` instead.
+
+The tools translate a whole file. They do not take a page range. To translate one page, write that page to its own file inside `MCP_WORKSPACE` and pass that path.
+
+`target_language` and `source_language` are codes: `en`, `de`, `fr`, `es`, `it`, `pt`, `nl`, `pl`, `uk`, `ja`, `zh`, `ko`. `source_language` is optional. The server detects it when you omit it.
+
+| Tool | Arguments | What you get back |
+| --- | --- | --- |
+| `estimate_translation` | `path`, `target_language`, optional `source_language` | Uploads the file, waits until analysis is ready, and returns `document_id`, `models` (a price for each model), and `pages`. |
+| `translate_document` | `path`, `target_language`, optional `source_language`, `output_path`, `wait` (default false) | Without `wait`: `{job_id, status, document_id}`. With `wait` true: follows progress, writes the file, and returns `output_path` and `cost_cents`. |
+| `get_translation_status` | `job_id` | The job, including `status`, `done_segments`, `total_segments`, and `cost_cents`. |
+| `download_translation` | `job_id`, optional `output_path` | Writes the finished file. The default path is next to the source: `{stem}.{target_language}{suffix}`. A photo becomes a PDF. If the MCP process restarted, pass `output_path` or the call returns `source_unknown`. |
+
+Cursor reads `.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` for every project:
 
 ```json
 {
@@ -110,17 +125,20 @@ Claude Code:
 claude mcp add --transport http stark-translator http://localhost:8001/mcp --header "Authorization: Bearer stk_…"
 ```
 
-Stdio reads `TRANSLATOR_API_TOKEN` instead of a request header:
+Stdio:
 
 ```bash
 MCP_TRANSPORT=stdio TRANSLATOR_API_URL=http://127.0.0.1:8000 TRANSLATOR_API_TOKEN=stk_… uv run --project backend python -m app.mcp
 ```
 
-Three-step check, without the web UI:
+Check on one page, without the web UI. `page.pdf` is already inside `MCP_WORKSPACE`.
 
-1. `translate_document` on a small PDF. The reply returns `job_id` immediately (`wait` defaults to false).
-2. `get_translation_status` on that job id until the status is `done`.
-3. `download_translation` writes the file. Pass `wait=true` to `translate_document` to report progress and download in the same call.
+1. `estimate_translation` with `path` set to that file and `target_language` set to `de`. Read the price in `models` before you translate.
+2. `translate_document` with the same `path` and `target_language`. Leave `wait` false. The reply has `job_id`.
+3. `get_translation_status` with that `job_id` until `status` is `done`.
+4. `download_translation` with that `job_id`. The file lands beside the source as `page.de.pdf`.
+
+Pass `wait` true to `translate_document` to follow progress and write the file in the same call. Progress comes from `GET /events?ticket=`. If that stream cannot be reached, the client polls REST.
 
 ## Acceptance
 
