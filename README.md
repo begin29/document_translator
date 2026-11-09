@@ -215,24 +215,3 @@ MCP_TRANSPORT=stdio TRANSLATOR_API_URL=http://127.0.0.1:8000 TRANSLATOR_API_TOKE
 ```
 
 Paths must sit under `MCP_WORKSPACE`, which defaults to your home folder. Anything else returns `path_outside_workspace`. Stdio has no request header, so it reads the token from `TRANSLATOR_API_TOKEN`.
-
-## Acceptance
-
-1. **Price before work, file after.** Upload a text PDF, see page count and a price for the chosen target language before Translate, and download a file that contains the translation. The default mode is `layout` (same page count and boxes when the translation fits; overflowing pages fall back to reflow).
-2. **A crash costs nothing twice.** Kill the worker after some segments are `done`. After restart those segments are not billed again, the job finishes, and the browser keeps showing progress. `GET /api/jobs/{id}/cost` equals the sum of `provider_calls` for that job.
-3. **Bad input gets a specific answer.** A corrupt PDF, an encrypted PDF, a renamed PNG, a file over `MAX_UPLOAD_MB`, and an unsupported type each return a specific `error_code` and message. None of them return a generic 500 or write a file outside the uploads directory.
-
-Also checked: two accounts do not see each other's documents, jobs, or cost stats, and another user's id returns 404.
-
-Criterion 1 is met for the price being shown, not for its accuracy once review runs: see "Measured cost and latency" in `DECISIONS.md`.
-
-## Quality metric
-
-The metric is the share of translated segments that pass two automatic checks after review:
-
-- target-language detection on every translated text block, except blocks that are numbers, URLs, or glossary terms kept verbatim
-- a length ratio inside the per-language bounds in `app/core/languages.py`
-
-Blocks outside those bounds are flagged and sent to review. The job event `review_done` records `quality_warning` when any flag remains.
-
-Measured on 9 Nov 2026 with `PROVIDER=openai` on 10 finished jobs (PDF, DOCX, and a photo; English, German, Ukrainian): **35 of 44 segments (80%) pass** after review, and 4 of the 10 jobs ended with `quality_warning`. Every flagged job was an image-heavy PDF (`text_with_pic_en.pdf`, `text_with_pic_ua_huge.pdf`). Text-only PDFs and DOCX files passed with no flags. It is a crude metric: it checks language and length, not meaning.
