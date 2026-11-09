@@ -130,8 +130,6 @@ npm test
 npm run build
 ```
 
-`scripts/benchmark.py` prints cost and p95 latency from `provider_calls` for one generated PDF. Set `DATABASE_URL` first.
-
 ## Testing guide
 
 Tests never call OpenAI. `conftest.py` forces `APP_ENV=test` and `PROVIDER=fake`, and `build_provider()` raises if it is asked for OpenAI under test.

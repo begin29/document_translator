@@ -32,7 +32,6 @@ Deeper context, read only when the task needs it: `README.md` (run, MCP, accepta
 | `backend/app/config.py` | `Settings` from env. `get_settings()` is cached |
 | `compose.realtime.yml` | Redis and the realtime service, included by `docker-compose.yml` |
 | `frontend/src/` | `App.tsx` (routes), `api.ts`, `copy.ts` (error strings), `useEventStream.ts` |
-| `scripts/benchmark.py` | Cost and p95 from `provider_calls` |
 
 A new format is one adapter plus an `ADAPTERS` entry plus a sniff branch. Image bytes stay on the files volume (`asset_path`). Blocks with `kind=image` are never sent to a provider.
 
