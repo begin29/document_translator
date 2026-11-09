@@ -143,6 +143,21 @@ class ApiClient:
         self._check(response)
         return response.json()
 
+    async def list_documents(self) -> list[dict]:
+        response = await self._http.get("/api/documents")
+        self._check(response)
+        return response.json()
+
+    async def request_upload(self) -> dict:
+        response = await self._http.post("/api/upload-links")
+        self._check(response)
+        return response.json()
+
+    async def download_link(self, job_id: str) -> dict:
+        response = await self._http.post(f"/api/jobs/{job_id}/download-link")
+        self._check(response)
+        return response.json()
+
     async def get_document(self, document_id: str) -> dict:
         return await self._get_visible(f"/api/documents/{document_id}")
 

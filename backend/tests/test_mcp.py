@@ -24,7 +24,9 @@ from app.core.provider.fake_provider import reset_crash_memory
 from app.core.service import reset_runtime, sync_gate
 from app.db.session import reset_engine, session_factory
 from app.mcp.__main__ import (
+    create_upload_url,
     download_translation,
+    list_documents,
     estimate_translation,
     get_translation_status,
     mcp,
@@ -105,6 +107,7 @@ def stack(_migrated, monkeypatch, tmp_path):
     monkeypatch.setenv("REALTIME_URL", realtime_url)
     monkeypatch.setenv("REDIS_URL", "redis://fake:6379/0")
     monkeypatch.setenv("MCP_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("PUBLIC_ORIGIN", api_url)
     monkeypatch.setenv("PROVIDER", "fake")
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("FAKE_LATENCY_MS", "200")
@@ -170,7 +173,7 @@ def stack(_migrated, monkeypatch, tmp_path):
             time.sleep(0.1)
         if status != "ready":
             raise RuntimeError(f"warmup analysis did not finish: {status}")
-        yield {"api": api_url, "realtime": realtime_url, "root": tmp_path}
+        yield {"api": api_url, "realtime": realtime_url, "root": tmp_path, "headers": auth_headers}
     finally:
         stop.set()
         worker.join(timeout=5)
@@ -186,7 +189,14 @@ def stack(_migrated, monkeypatch, tmp_path):
 
 def test_tools_registered():
     names = {tool.name for tool in mcp._tool_manager.list_tools()}
-    assert names == {"estimate_translation", "translate_document", "get_translation_status", "download_translation"}
+    assert names == {
+        "create_upload_url",
+        "list_documents",
+        "estimate_translation",
+        "translate_document",
+        "get_translation_status",
+        "download_translation",
+    }
     assert all(tool.is_async for tool in mcp._tool_manager.list_tools())
 
 
@@ -197,7 +207,7 @@ async def test_translate_returns_job_id_immediately(stack):
         uploaded = await api.upload(str(path))
         await api.wait_document(uploaded["id"])
     started = time.monotonic()
-    result = await translate_document(str(path), "de", wait=False)
+    result = await translate_document(path=str(path), target_language="de", wait=False)
     elapsed = time.monotonic() - started
     assert elapsed < 1
     assert result["job_id"]
@@ -227,10 +237,10 @@ async def test_parallel_translations_do_not_block(stack):
             last = now
 
     async def run_translate(name: str, path: Path) -> None:
-        results[name] = await translate_document(str(path), "de", wait=True)
+        results[name] = await translate_document(path=str(path), target_language="de", wait=True)
 
     async def run_estimate() -> None:
-        results["estimate"] = await estimate_translation(str(third), "de")
+        results["estimate"] = await estimate_translation(path=str(third), target_language="de")
 
     async def jobs() -> None:
         try:
@@ -268,7 +278,7 @@ async def test_progress_reported(stack):
             self.events.append((done, total or 1, status or ""))
 
     ctx = Ctx()
-    result = await translate_document(str(path), "de", wait=True, ctx=ctx)
+    result = await translate_document(path=str(path), target_language="de", wait=True, ctx=ctx)
     assert result["status"] == "done"
     dones = [item[0] for item in ctx.events]
     assert len(dones) >= 2
@@ -279,10 +289,10 @@ async def test_progress_reported(stack):
 async def test_path_outside_workspace_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_WORKSPACE", str(tmp_path))
     with pytest.raises(ToolError, match="path_outside_workspace"):
-        await estimate_translation("/etc/hosts", "de")
+        await estimate_translation(path="/etc/hosts", target_language="de")
     inside = tmp_path / "inside.pdf"
     with pytest.raises(ToolError, match="path_outside_workspace"):
-        await translate_document(str(inside), "de", output_path="/etc/outside.pdf", wait=False)
+        await translate_document(path=str(inside), target_language="de", output_path="/etc/outside.pdf", wait=False)
 
 
 async def test_realtime_down_falls_back(stack, monkeypatch):
@@ -290,7 +300,7 @@ async def test_realtime_down_falls_back(stack, monkeypatch):
     monkeypatch.setenv("REALTIME_URL", f"http://127.0.0.1:{closed}")
     path = stack["root"] / "fallback.pdf"
     _pdf(path, ["This translation finishes by polling REST when realtime is closed."])
-    result = await translate_document(str(path), "de", wait=True)
+    result = await translate_document(path=str(path), target_language="de", wait=True)
     assert result["status"] == "done"
     assert Path(result["output_path"]).read_bytes()[:4] == b"%PDF"
     saved = await download_translation(result["job_id"], str(stack["root"] / "fallback-copy.pdf"))
@@ -301,4 +311,113 @@ async def test_api_error_mapped(stack):
     path = stack["root"] / "broken.pdf"
     path.write_bytes(b"this is not a pdf")
     with pytest.raises(ToolError, match="corrupt_pdf|encrypted_pdf"):
-        await estimate_translation(str(path), "de")
+        await estimate_translation(path=str(path), target_language="de")
+
+
+def _send(upload_url: str, path: Path) -> httpx.Response:
+    return httpx.post(upload_url, files={"file": (path.name, path.read_bytes())}, timeout=10)
+
+
+async def test_remote_upload_translate_and_download(stack, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("client") / "remote.pdf"
+    _pdf(outside, ["A file that lives on the caller's machine, not in the workspace."])
+    link = await create_upload_url(filename=str(outside))
+    assert link["upload_url"].startswith(f"{stack['api']}/api/uploads?ticket=")
+    assert str(outside) in link["command"]
+    sent = _send(link["upload_url"], outside)
+    assert sent.status_code == 200, sent.text
+    document_id = sent.json()["id"]
+
+    quote = await estimate_translation(document_id=document_id, target_language="de")
+    assert quote["document_id"] == document_id
+    assert quote["models"]
+
+    result = await translate_document(document_id=document_id, target_language="de", wait=True)
+    assert result["status"] == "done"
+    assert "output_path" not in result
+    fetched = httpx.get(result["download_url"], timeout=10)
+    assert fetched.status_code == 200
+    assert fetched.content[:4] == b"%PDF"
+
+    again = await download_translation(result["job_id"])
+    assert httpx.get(again["download_url"], timeout=10).content[:4] == b"%PDF"
+    saved = await download_translation(result["job_id"], str(stack["root"] / "remote.de.pdf"))
+    assert Path(saved["output_path"]).read_bytes()[:4] == b"%PDF"
+
+
+async def test_path_or_document_id_required(stack):
+    with pytest.raises(ToolError, match="invalid_arguments"):
+        await translate_document(target_language="de")
+    with pytest.raises(ToolError, match="invalid_arguments"):
+        await estimate_translation(path=str(stack["root"] / "x.pdf"), document_id="abc", target_language="de")
+
+
+async def test_transfer_tickets_are_scoped(stack):
+    from app.auth import tickets
+
+    path = stack["root"] / "scoped.pdf"
+    _pdf(path, ["Tickets for one purpose must not open another."])
+    events = httpx.post(f"{stack['api']}/api/events/ticket", headers=stack["headers"], timeout=10).json()["ticket"]
+    rejected = _send(f"{stack['api']}/api/uploads?ticket={events}", path)
+    assert rejected.status_code == 401
+    assert rejected.json()["code"] == "invalid_ticket"
+
+    link = await create_upload_url()
+    tampered = link["upload_url"][:-1] + ("0" if link["upload_url"][-1] != "0" else "1")
+    assert _send(tampered, path).status_code == 401
+
+    document_id = _send(link["upload_url"], path).json()["id"]
+    result = await translate_document(document_id=document_id, target_language="de", wait=True)
+    download_url = result["download_url"]
+    ticket = download_url.split("ticket=", 1)[1]
+    other_job = await translate_document(document_id=document_id, target_language="fr", wait=False)
+    wrong_job = httpx.get(f"{stack['api']}/api/downloads/{other_job['job_id']}?ticket={ticket}", timeout=10)
+    assert wrong_job.status_code == 401
+    upload_as_download = link["upload_url"].split("ticket=", 1)[1]
+    assert httpx.get(f"{stack['api']}/api/downloads/{result['job_id']}?ticket={upload_as_download}", timeout=10).status_code == 401
+
+    uid = tickets.verify(ticket, "download", result["job_id"])
+    expired, _exp = tickets.issue(uid, "download", -1, result["job_id"])
+    assert httpx.get(f"{stack['api']}/api/downloads/{result['job_id']}?ticket={expired}", timeout=10).status_code == 401
+
+
+class _HttpCtx:
+    def __init__(self, headers: dict) -> None:
+        request = type("Request", (), {"headers": {key.lower(): value for key, value in headers.items()}})()
+        self._request_context = type("Holder", (), {"request": request})()
+
+    async def report_progress(self, done: int, total: int, status: str | None = None) -> None:
+        return None
+
+
+async def test_http_clients_cannot_pass_paths(stack):
+    ctx = _HttpCtx(stack["headers"])
+    inside = stack["root"] / "inside.pdf"
+    _pdf(inside, ["Even a file in the workspace is off limits over HTTP."])
+    with pytest.raises(ToolError, match="path_not_supported"):
+        await estimate_translation(path=str(inside), target_language="de", ctx=ctx)
+    link = await create_upload_url(ctx=ctx)
+    document_id = _send(link["upload_url"], inside).json()["id"]
+    with pytest.raises(ToolError, match="path_not_supported"):
+        await translate_document(
+            document_id=document_id, target_language="de", output_path=str(stack["root"] / "x.pdf"), ctx=ctx
+        )
+    result = await translate_document(document_id=document_id, target_language="de", wait=True, ctx=ctx)
+    assert "output_path" not in result
+    assert httpx.get(result["download_url"], timeout=10).content[:4] == b"%PDF"
+    with pytest.raises(ToolError, match="path_not_supported"):
+        await download_translation(result["job_id"], str(stack["root"] / "y.pdf"), ctx=ctx)
+    assert (await download_translation(result["job_id"], ctx=ctx))["download_url"]
+
+
+async def test_list_documents_filters_by_name(stack):
+    for name in ("Invoice-March.pdf", "contract.pdf"):
+        path = stack["root"] / name
+        _pdf(path, [f"Body text for {name}."])
+        _send((await create_upload_url())["upload_url"], path).raise_for_status()
+    everything = (await list_documents())["documents"]
+    assert [item["filename"] for item in everything[:2]] == ["contract.pdf", "Invoice-March.pdf"]
+    assert set(everything[0]) == {"id", "filename", "format", "page_count", "detected_source_lang", "analysis_status", "created_at"}
+    matched = (await list_documents(name="invoice"))["documents"]
+    assert [item["filename"] for item in matched] == ["Invoice-March.pdf"]
+    assert len((await list_documents(limit=1))["documents"]) == 1

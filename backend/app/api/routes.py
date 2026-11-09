@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
@@ -11,6 +11,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.auth.deps import current_user, get_session, require_admin
+from app.auth.tickets import TRANSFER_TTL_SECONDS, issue, verify
 from app.config import get_settings
 from app.core.chunking import segment_budget
 from app.core.errors import AppError
@@ -111,12 +112,7 @@ def _job(job: TranslationJob, filename: str | None = None) -> dict:
     }
 
 
-@router.post("/documents")
-async def upload_document(
-    file: UploadFile = File(...),
-    session: Session = Depends(get_session),
-    user: User = Depends(current_user),
-):
+async def _store_upload(file: UploadFile, session: Session, user: User) -> dict:
     settings = get_settings()
     if file.size is not None and file.size > settings.max_upload_bytes:
         raise AppError(
@@ -129,6 +125,48 @@ async def upload_document(
     data = await file.read()
     document = create_document(session, data, file.filename or "upload", user.id)
     return _document(document)
+
+
+def _ticket_user(session: Session, ticket: str, purpose: str, subject: str = "") -> User:
+    uid = verify(ticket, purpose, subject)
+    user = session.get(User, uid) if uid is not None else None
+    if user is None:
+        raise AppError("invalid_ticket", "This link is invalid or has expired.", "", False, 401)
+    return user
+
+
+def _link(path: str, ticket: str, exp: int) -> dict:
+    origin = get_settings().public_origin.rstrip("/")
+    return {
+        "url": f"{origin}{path}?ticket={ticket}",
+        "expires_at": datetime.fromtimestamp(exp, timezone.utc).isoformat(),
+    }
+
+
+@router.post("/documents")
+async def upload_document(
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    return await _store_upload(file, session, user)
+
+
+@router.post("/upload-links")
+def upload_link(user: User = Depends(current_user)):
+    ticket, exp = issue(user.id, "upload", TRANSFER_TTL_SECONDS)
+    link = _link("/api/uploads", ticket, exp)
+    return {"upload_url": link["url"], "expires_at": link["expires_at"]}
+
+
+@router.post("/uploads")
+async def upload_with_ticket(
+    ticket: str = Query(...),
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+):
+    user = _ticket_user(session, ticket, "upload")
+    return await _store_upload(file, session, user)
 
 
 @router.get("/documents/{document_id}")
@@ -305,6 +343,24 @@ def post_render(job_id: uuid.UUID, session: Session = Depends(get_session), user
 
 @router.get("/jobs/{job_id}/download")
 def download(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    return _job_file(session, job_id, user)
+
+
+@router.post("/jobs/{job_id}/download-link")
+def download_link(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    owned(session, TranslationJob, job_id, user)
+    ticket, exp = issue(user.id, "download", TRANSFER_TTL_SECONDS, str(job_id))
+    link = _link(f"/api/downloads/{job_id}", ticket, exp)
+    return {"download_url": link["url"], "expires_at": link["expires_at"]}
+
+
+@router.get("/downloads/{job_id}")
+def download_with_ticket(job_id: uuid.UUID, ticket: str = Query(...), session: Session = Depends(get_session)):
+    user = _ticket_user(session, ticket, "download", str(job_id))
+    return _job_file(session, job_id, user)
+
+
+def _job_file(session: Session, job_id: uuid.UUID, user: User) -> FileResponse:
     job = owned(session, TranslationJob, job_id, user)
     if job.output_stale or not job.output_path:
         if job.status not in {"done", "rendering"}:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -74,17 +75,20 @@ def _client(ctx=None) -> ApiClient:
     return ApiClient(base, realtime, token=token)
 
 
-def _workspace() -> Path | None:
+def _workspace() -> Path:
     raw = os.environ.get("MCP_WORKSPACE", "").strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser().resolve()
+    return Path(raw or Path.home()).expanduser().resolve()
 
 
-def _resolve(path: str) -> Path:
+def _resolve(path: str, ctx=None) -> Path:
+    if _http_request(ctx) is not None:
+        raise ApiError(
+            "path_not_supported",
+            "This server cannot read files on your machine. Call create_upload_url, upload the file, and pass document_id.",
+            False,
+        )
     resolved = Path(path).expanduser().resolve()
-    root = _workspace()
-    if root is not None and not resolved.is_relative_to(root):
+    if not resolved.is_relative_to(_workspace()):
         raise ApiError("path_outside_workspace", f"{resolved} is outside the workspace.", False)
     return resolved
 
@@ -108,19 +112,79 @@ def _remember(job_id: str, source: Path) -> None:
     _sources[str(job_id)] = str(source)
 
 
+def _source(path: str | None, document_id: str | None, ctx=None) -> Path | None:
+    if bool(path) == bool(document_id):
+        raise ApiError("invalid_arguments", "Pass either path or document_id, not both.", False)
+    return _resolve(path, ctx) if path else None
+
+
+_LISTED = ("id", "filename", "format", "page_count", "detected_source_lang", "analysis_status", "created_at")
+
+
+async def _ready(api: ApiClient, source: Path | None, document_id: str | None) -> dict:
+    if source is not None:
+        document_id = (await api.upload(str(source)))["id"]
+    return await api.wait_document(document_id)
+
+
+@mcp.tool()
+async def list_documents(name: str | None = None, limit: int = 20, ctx: Context | None = None) -> dict:
+    """List the caller's documents, newest first, including files uploaded in the web app.
+
+    Use it to find a document the user mentions by name; `name` matches part of the filename,
+    case-insensitively. Pass the returned `id` as `document_id` to estimate_translation or translate_document.
+    """
+    try:
+        async with _client(ctx) as api:
+            documents = await api.list_documents()
+    except ApiError as exc:
+        raise _fail(exc) from exc
+    if name:
+        needle = name.casefold()
+        documents = [item for item in documents if needle in str(item.get("filename") or "").casefold()]
+    limit = max(1, min(limit, 100))
+    return {"documents": [{key: item.get(key) for key in _LISTED} for item in documents[:limit]]}
+
+
+@mcp.tool()
+async def create_upload_url(filename: str | None = None, ctx: Context | None = None) -> dict:
+    """Get a short-lived URL for sending a file from the caller's machine to the translator.
+
+    Use this for a file on the user's machine that is not yet uploaded (check list_documents first).
+    Run the returned `command` in a shell (replace the file path if needed); without a shell, give the
+    command to the user. It prints the uploaded document as JSON. Pass its `id` as `document_id`
+    to estimate_translation or translate_document.
+    """
+    try:
+        async with _client(ctx) as api:
+            link = await api.request_upload()
+    except ApiError as exc:
+        raise _fail(exc) from exc
+    local = shlex.quote(f"file=@{filename or '<path-to-file>'}")
+    return {
+        "upload_url": link["upload_url"],
+        "expires_at": link["expires_at"],
+        "command": f"curl -fsS -F {local} {shlex.quote(link['upload_url'])}",
+    }
+
+
 @mcp.tool()
 async def estimate_translation(
-    path: str,
     target_language: str,
+    path: str | None = None,
+    document_id: str | None = None,
     source_language: str | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Estimate tokens, segments, and price for a document before translating it."""
+    """Estimate tokens, segments, and price for a document before translating it.
+
+    Pass `document_id` (from list_documents or create_upload_url). `path` works only when the server
+    runs locally over stdio.
+    """
     try:
-        source = _resolve(path)
+        source = _source(path, document_id, ctx)
         async with _client(ctx) as api:
-            uploaded = await api.upload(str(source))
-            document = await api.wait_document(uploaded["id"])
+            document = await _ready(api, source, document_id)
             quote = await api.estimate_document(document["id"], target_language)
         analysis = document.get("analysis") or {}
         return {
@@ -136,22 +200,28 @@ async def estimate_translation(
 
 @mcp.tool()
 async def translate_document(
-    path: str,
     target_language: str,
+    path: str | None = None,
+    document_id: str | None = None,
     source_language: str | None = None,
     output_path: str | None = None,
     wait: bool = False,
     ctx: Context | None = None,
 ) -> dict:
-    """Translate a PDF, DOCX, or photo. Returns a job id immediately unless wait is true."""
+    """Translate a PDF, DOCX, or photo. Returns a job id immediately unless wait is true.
+
+    Pass `document_id` (from list_documents or create_upload_url). `path` and `output_path` work only
+    when the server runs locally over stdio. With wait true, the result has a short-lived `download_url`,
+    or `output_path` when the file was written locally.
+    """
     try:
-        source = _resolve(path)
-        target = _resolve(output_path) if output_path else None
+        source = _source(path, document_id, ctx)
+        target = _resolve(output_path, ctx) if output_path else None
         async with _client(ctx) as api:
-            uploaded = await api.upload(str(source))
-            document = await api.wait_document(uploaded["id"])
+            document = await _ready(api, source, document_id)
             job = await api.create_job(document["id"], target_language, source_language)
-            _remember(job["id"], source)
+            if source is not None:
+                _remember(job["id"], source)
             if not wait:
                 return {"job_id": job["id"], "status": job["status"], "document_id": document["id"]}
 
@@ -160,14 +230,21 @@ async def translate_document(
                     await ctx.report_progress(done, total, status)
 
             finished = await api.wait_job(job["id"], on_progress)
-            destination = target or _resolve(str(_default_output(source, target_language)))
-            _write_atomic(destination, await api.download(finished["id"]))
-        return {
-            "job_id": finished["id"],
-            "output_path": str(destination),
-            "cost_cents": finished.get("cost_cents"),
-            "status": finished.get("status"),
-        }
+            result = {
+                "job_id": finished["id"],
+                "cost_cents": finished.get("cost_cents"),
+                "status": finished.get("status"),
+            }
+            if target is None and source is not None:
+                target = _resolve(str(_default_output(source, target_language)))
+            if target is None:
+                link = await api.download_link(finished["id"])
+                result["download_url"] = link["download_url"]
+                result["expires_at"] = link["expires_at"]
+                return result
+            _write_atomic(target, await api.download(finished["id"]))
+        result["output_path"] = str(target)
+        return result
     except ApiError as exc:
         raise _fail(exc) from exc
 
@@ -184,21 +261,21 @@ async def get_translation_status(job_id: str, ctx: Context | None = None) -> dic
 
 @mcp.tool()
 async def download_translation(job_id: str, output_path: str | None = None, ctx: Context | None = None) -> dict:
-    """Download a finished translation. Writes next to the source when output_path is omitted."""
+    """Get a finished translation.
+
+    Returns a short-lived `download_url` the caller can fetch, e.g. with `curl -fsSOJ <url>`.
+    On a local stdio server it writes to `output_path`, or next to the source of a `path` job.
+    """
     try:
+        target = _resolve(output_path, ctx) if output_path else None
         async with _client(ctx) as api:
-            if output_path:
-                target = _resolve(output_path)
-            else:
-                source_path = _sources.get(str(job_id))
-                if not source_path:
-                    raise ApiError(
-                        "source_unknown",
-                        "Pass output_path. The source file for this job is not known.",
-                        False,
-                    )
+            source_path = _sources.get(str(job_id))
+            if target is None and source_path:
                 job = await api.get_job(job_id)
                 target = _resolve(str(_default_output(Path(source_path), job["target_lang"])))
+            if target is None:
+                link = await api.download_link(job_id)
+                return {"job_id": job_id, "download_url": link["download_url"], "expires_at": link["expires_at"]}
             _write_atomic(target, await api.download(job_id))
         return {"job_id": job_id, "output_path": str(target)}
     except ApiError as exc:

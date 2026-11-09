@@ -29,7 +29,7 @@ from app.core.service import create_document, create_job, process_available, rea
 from app.db.models import BlockTranslation, ProviderCall
 from app.db.session import reset_engine, session_factory
 from app.main import app
-from app.mcp.__main__ import estimate_translation, translate_document
+from app.mcp.__main__ import create_upload_url, estimate_translation, list_documents, translate_document
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL is not set")
 ORIGIN = "http://localhost:8080"
@@ -447,7 +447,7 @@ async def test_mcp_requires_a_token(tmp_path, monkeypatch):
     path = tmp_path / "note.pdf"
     _pdf(path, ["A token is required before this page can be uploaded."])
     with pytest.raises(ToolError, match="unauthorized"):
-        await estimate_translation(str(path), "de")
+        await estimate_translation(path=str(path), target_language="de")
 
 
 async def test_mcp_token_job_is_listed_for_that_user(session, tmp_path, monkeypatch):
@@ -489,7 +489,14 @@ async def test_mcp_token_job_is_listed_for_that_user(session, tmp_path, monkeypa
             assert other.status_code == 200, other.text
         path = tmp_path / "owned.pdf"
         _pdf(path, ["This translation belongs only to the token holder."])
-        result = await translate_document(str(path), "de", wait=False, ctx=_Ctx(token))
+        with pytest.raises(ToolError, match="path_not_supported"):
+            await translate_document(path=str(path), target_language="de", wait=False, ctx=_Ctx(token))
+        link = await create_upload_url(ctx=_Ctx(token))
+        sent = httpx.post(link["upload_url"].replace(ORIGIN, api_url, 1), files={"file": (path.name, path.read_bytes())}, timeout=10)
+        assert sent.status_code == 200, sent.text
+        listed_docs = await list_documents(name="OWNED", ctx=_Ctx(token))
+        assert [item["id"] for item in listed_docs["documents"]] == [sent.json()["id"]]
+        result = await translate_document(document_id=sent.json()["id"], target_language="de", wait=False, ctx=_Ctx(token))
         listed = httpx.get(f"{api_url}/api/jobs", headers={"Authorization": f"Bearer {token}"}, timeout=10)
         assert listed.status_code == 200
         assert any(item["id"] == result["job_id"] for item in listed.json())
