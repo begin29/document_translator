@@ -60,7 +60,7 @@ PDF render modes: `layout` (default) and `reflow`. Layout paints into the origin
 
 ## API and MCP
 
-Errors are `AppError` → `{code, message, detail, retryable}` with a real status. Add a specific message in `frontend/src/copy.ts` for every new code. Upload codes already in use: `file_too_large`, `invalid_file`, `corrupt_pdf`, `corrupt_file`, `encrypted_pdf`, `unsupported_type`, `empty_document`, `not_a_document`. Job codes: `ocr_no_text`, `provider_timeout`, `provider_error`, `rate_limited`, `cost_cap_exceeded`, `not_ready`, `unknown_language`, `unknown_model`, `cancelled`.
+Errors are `AppError` → `{code, message, detail, retryable}` with a real status. Add a specific message in `frontend/src/copy.ts` for every new code. Upload codes already in use: `file_too_large`, `invalid_file`, `corrupt_pdf`, `corrupt_file`, `encrypted_pdf`, `unsupported_type`, `empty_document`, `not_a_document`. Job codes: `ocr_no_text`, `provider_timeout`, `provider_error`, `rate_limited`, `funds_exceeded`, `cost_cap_exceeded`, `not_ready`, `unknown_language`, `unknown_model`, `cancelled`.
 
 `POST /api/jobs` honors `Idempotency-Key` and returns the existing job. The handler commits before the response is sent. Same sha256 returns the existing document for that user. Uploads stay under `FILES_DIR` (`uploads/`, `assets/`, `thumbs/`). The upload limit is `MAX_UPLOAD_MB` (default 40) and the UI reads it from `GET /api/meta/config`. Filename is the basename only.
 
@@ -78,9 +78,9 @@ MCP tools, and only these: `estimate_translation`, `translate_document`, `get_tr
 
 `build_provider()` returns `OpenAIProvider` only when `PROVIDER=openai`. It raises if `APP_ENV=test`. Tests and QA failure scenarios stay on `FakeProvider`.
 
-Fake knobs: `FAKE_LATENCY_MS`, `FAKE_FAIL_MODE` (`http500|timeout|rate_limit|untranslated`), `FAKE_FAIL_SEGMENTS`, `FAKE_FAIL_RATE`, `CRASH_AFTER_SEGMENT`.
+Fake knobs: `FAKE_LATENCY_MS`, `FAKE_FAIL_MODE` (`http500|timeout|rate_limit|funds_exceeded|untranslated`), `FAKE_FAIL_SEGMENTS`, `FAKE_FAIL_RATE`, `CRASH_AFTER_SEGMENT`.
 
-Concurrency ceilings: `PROVIDER_MAX_CONCURRENCY` (32), `PROVIDER_TPM_BUDGET` (2_000_000), `JOB_MAX_CONCURRENCY` (16). The gate is a Postgres counter shared by worker replicas. A 429 halves effective concurrency and ramps one slot per quiet minute. `SEGMENT_ATTEMPT_LIMIT` is 3.
+Concurrency ceilings: `PROVIDER_MAX_CONCURRENCY` (32), `PROVIDER_TPM_BUDGET` (2_000_000), `JOB_MAX_CONCURRENCY` (16). The gate is a Postgres counter shared by worker replicas. A rate-limit 429 halves effective concurrency and ramps one slot per quiet minute. A spend-limit or insufficient-quota 429 is `funds_exceeded`: the job stops immediately and the gate stays unchanged. `SEGMENT_ATTEMPT_LIMIT` is 3.
 
 `OTEL_EXPORTER=none|otlp` (default `none`) exports API spans when the exporter package is installed. `AGENT_TRACE_EXPORTER` covers the review agent only. `AGENT_TRACE_EXPORTER=otlp` is still a no-op. Observability containers are the `observability` compose profile.
 

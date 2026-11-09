@@ -65,7 +65,7 @@ export function mergeState<T extends StateFields>(current: T, msg: StreamMessage
   const previousStatus = msg.type === "job" ? current.status : current.analysis_status;
   const nextTerminal = isTerminal(kind, nextStatus);
   const previousTerminal = isTerminal(kind, previousStatus);
-  if (previousTerminal && !nextTerminal) return current;
+  if (previousTerminal && !nextTerminal && !(kind === "job" && previousStatus === "failed")) return current;
   const currentSeq = current.seq ?? 0;
   if (msg.seq <= currentSeq && !(nextTerminal && !previousTerminal)) return current;
   const seq = Math.max(msg.seq, currentSeq);
@@ -92,7 +92,7 @@ export function applySnapshot<T extends StateFields>(current: T | undefined, inc
   if (!current) return incoming;
   const previous = kind === "job" ? current.status : current.analysis_status;
   const next = kind === "job" ? incoming.status : incoming.analysis_status;
-  if (isTerminal(kind, previous) && !isTerminal(kind, next)) return current;
+  if (isTerminal(kind, previous) && !isTerminal(kind, next) && !(kind === "job" && previous === "failed")) return current;
   const seq = Math.max(current.seq ?? 0, incoming.seq ?? 0);
   if (!seq) return incoming;
   return { ...incoming, seq };

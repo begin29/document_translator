@@ -11,6 +11,7 @@ export const ERROR_COPY: Record<string, string> = {
   provider_timeout: "The translation provider timed out. The job stopped after the retry limit.",
   provider_error: "The translation provider returned an error. The job stopped after the retry limit.",
   rate_limited: "The translation provider asked us to slow down.",
+  funds_exceeded: "The translation account has reached its spend limit. Raise the limit or add funds, then retry.",
   cost_cap_exceeded: "This job hit its cost cap and stopped before further provider calls.",
   analysis_failed: "Analysis failed before a price could be shown.",
   render_failed: "The translated file could not be rendered.",
@@ -18,6 +19,7 @@ export const ERROR_COPY: Record<string, string> = {
   unknown_model: "That model is not available.",
   unknown_language: "That target language is not supported.",
   cancelled: "This translation was cancelled.",
+  not_retryable: "This translation cannot be retried.",
   service_unavailable: "The translator is temporarily unavailable. Try again in a moment.",
   invalid_response: "The server returned a response that could not be read.",
   path_outside_workspace: "That file path is outside the workspace.",
@@ -38,6 +40,13 @@ export function errorMessage(code: string | null | undefined, fallback?: string 
   if (fallback) return fallback;
   if (code) return `Stopped with code ${code}.`;
   return "The request did not complete.";
+}
+
+export function sameNotice(message: string, detail: string): boolean {
+  const left = message.trim();
+  const right = detail.trim();
+  if (!left || !right) return false;
+  return left === right || right.startsWith(left) || left.startsWith(right);
 }
 
 export function progressLabel(done: number, total: number, status: string): string {

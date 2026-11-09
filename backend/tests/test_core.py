@@ -296,6 +296,60 @@ def test_not_a_document_guardrail_trips():
     ensure_is_document([PageInfo(page=1, page_class="text", route="text")])
 
 
+class _ProviderError(Exception):
+    def __init__(self, status_code: int, body=None, code: str | None = None, headers: dict | None = None) -> None:
+        super().__init__("provider error")
+        self.status_code = status_code
+        self.body = body
+        self.code = code
+        self.response = type("Response", (), {"headers": headers or {}})()
+
+
+def test_spend_limit_is_not_a_rate_limit():
+    from app.core.errors import FundsExceeded, ProviderFailure, RateLimited
+    from app.core.provider.openai_provider import raise_mapped
+
+    spend = _ProviderError(
+        429,
+        {
+            "error": {
+                "message": "Your project has reached its configured enforced spend limit.",
+                "type": "insufficient_quota",
+                "param": None,
+                "code": "project_spend_limit_exceeded",
+            }
+        },
+    )
+    with pytest.raises(FundsExceeded) as funds:
+        raise_mapped(spend)
+    assert funds.value.code == "funds_exceeded"
+    assert funds.value.retryable is False
+
+    quota = _ProviderError(429, {"error": {"message": "You exceeded your current quota.", "type": "insufficient_quota", "code": "insufficient_quota"}})
+    with pytest.raises(FundsExceeded):
+        raise_mapped(quota)
+
+    billing = _ProviderError(429, code="billing_hard_limit_reached")
+    with pytest.raises(FundsExceeded):
+        raise_mapped(billing)
+
+    limited = _ProviderError(
+        429,
+        {"error": {"message": "Rate limit reached for gpt-4o-mini.", "type": "tokens", "code": "rate_limit_exceeded"}},
+        headers={"retry-after": "2"},
+    )
+    with pytest.raises(RateLimited) as rate:
+        raise_mapped(limited)
+    assert rate.value.retryable is True
+    assert rate.value.retry_after == 2
+
+    with pytest.raises(RateLimited):
+        raise_mapped(_ProviderError(429))
+
+    with pytest.raises(ProviderFailure):
+        raise_mapped(_ProviderError(500, {"error": {"message": "server error"}}))
+
+
 def test_meta_models_include_segment_budget():
     from app.api.routes import models
 

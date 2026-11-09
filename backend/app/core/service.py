@@ -15,7 +15,7 @@ from app.core.analysis.page_classifier import route_for
 from app.core.analysis.preprocess import preprocess_page, to_png
 from app.core.chunking import chunk_blocks, segment_budget
 from app.core.domain import BlockData
-from app.core.errors import AppError, CostCapExceeded, InjectedCrash, RateLimited
+from app.core.errors import AppError, CostCapExceeded, FundsExceeded, InjectedCrash, RateLimited
 from app.core.events import after_commit, publish_document, publish_job
 from app.core.formats.registry import adapter_for, detect_format
 from app.core.formats.sniff import sanitized_filename
@@ -455,6 +455,47 @@ def create_job(
     return job
 
 
+_RETRYABLE = frozenset({"rate_limited", "funds_exceeded", "provider_timeout", "provider_error"})
+
+
+def retry_job(session: Session, job_id: uuid.UUID) -> TranslationJob:
+    job = session.get(TranslationJob, job_id)
+    if job is None:
+        raise AppError("not_found", "Job not found.", str(job_id), False, 404)
+    if job.status != "failed" or job.error_code not in _RETRYABLE:
+        raise AppError("not_retryable", "This translation cannot be retried.", job.error_code or job.status, False, 409)
+    job.status = _requeue_failed_work(session, job)
+    job.error_code = None
+    job.error_detail = None
+    job.locked_by = None
+    job.locked_at = None
+    _event(session, job.id, "retried", {"status": job.status})
+    _publish_job(session, job)
+    return job
+
+
+def _requeue_failed_work(session: Session, job: TranslationJob) -> str:
+    segments = session.scalars(select(Segment).where(Segment.job_id == job.id)).all()
+    if segments:
+        for segment in segments:
+            if segment.status == "done":
+                continue
+            segment.status = "pending"
+            segment.locked_by = None
+            segment.locked_at = None
+            segment.attempt = 0
+        return "translating"
+    pages = session.scalars(select(OcrPage).where(OcrPage.job_id == job.id)).all()
+    open_pages = [page for page in pages if page.status != "done"]
+    if open_pages:
+        for page in open_pages:
+            page.status = "pending"
+            page.locked_by = None
+            page.locked_at = None
+        return "ocr"
+    return "queued"
+
+
 def cancel_job(session: Session, job_id: uuid.UUID) -> TranslationJob:
     job = session.get(TranslationJob, job_id)
     if job is None:
@@ -688,7 +729,8 @@ def _extract_job(session: Session, job_id: uuid.UUID, worker_id: str) -> None:
         _publish_job(session, job)
         logger.info("ocr_queued", pages=ocr_pages)
         return
-    _ensure_summary(session, job, document)
+    if not _ensure_summary(session, job, document):
+        return
     _build_segments(session, job)
     logger.info("segments_ready", total=job.total_segments)
 
@@ -785,7 +827,8 @@ def _advance_ocr_job(session: Session, job: TranslationJob) -> None:
         empty_pages = [row.page_no for row in session.scalars(select(OcrPage).where(OcrPage.job_id == job.id))]
         _fail(session, job, "ocr_no_text", f"No readable text was found on pages {', '.join(str(n) for n in empty_pages)}.")
         return
-    _ensure_summary(session, job, document)
+    if not _ensure_summary(session, job, document):
+        return
     _build_segments(session, job)
 
 
@@ -1047,8 +1090,13 @@ def _review_job(session: Session, job_id: uuid.UUID, worker_id: str) -> None:
 
     job = session.get(TranslationJob, job_id)
     logger = log.bind(job_id=str(job_id), stage="review", worker_id=worker_id)
-    with span("review_segment", job_id=str(job_id)):
-        warning = review_job(session, job, _provider())
+    try:
+        with span("review_segment", job_id=str(job_id)):
+            warning = review_job(session, job, _provider())
+    except AppError as exc:
+        _fail(session, job, exc.code, exc.message)
+        logger.info("review_failed", error_code=exc.code)
+        return
     if warning:
         job.quality_warning = True
         _event(session, job.id, "quality_warning", {"detail": "One or more segments were retranslated after a quality check."})
@@ -1190,14 +1238,14 @@ def _call_with_retries(session: Session, request: TranslateRequest):
         return result
 
 
-def _ensure_summary(session: Session, job: TranslationJob, document: Document) -> None:
+def _ensure_summary(session: Session, job: TranslationJob, document: Document) -> bool:
     if job.summary:
-        return
+        return True
     rows = session.scalars(select(Block.text).where(Block.document_id == document.id, Block.text.is_not(None)).limit(8)).all()
     excerpt = "\n".join(text for text in rows if text)[:4000]
     if not excerpt:
         job.summary = ""
-        return
+        return True
     request = TranslateRequest(
         stage="summary",
         model=get_settings().default_model,
@@ -1210,15 +1258,19 @@ def _ensure_summary(session: Session, job: TranslationJob, document: Document) -
     )
     if not _try_acquire(500):
         job.summary = excerpt[:400]
-        return
+        return True
     try:
         result = _call_with_retries(session, request)
         job.summary = result.text[:1200]
         _add_cost(session, job, request.model, result.tokens_in, result.tokens_out, result.recorded_cents)
+    except FundsExceeded as exc:
+        _fail(session, job, exc.code, exc.message)
+        return False
     except AppError:
         job.summary = excerpt[:400]
     finally:
         _release()
+    return True
 
 
 def _try_acquire(estimate: int) -> bool:

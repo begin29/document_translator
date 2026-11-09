@@ -26,6 +26,7 @@ from app.core.service import (
     estimate_for,
     public_estimate,
     render_job,
+    retry_job,
 )
 from app.db.models import Block, BlockTranslation, Document, JobEvent, ProviderCall, Segment, TranslationJob, User
 
@@ -200,6 +201,13 @@ def read_job(job_id: uuid.UUID, session: Session = Depends(get_session), user: U
 def post_cancel(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
     owned(session, TranslationJob, job_id, user)
     job = cancel_job(session, job_id)
+    return _job(job, _filename(session, job.document_id))
+
+
+@router.post("/jobs/{job_id}/retry")
+def post_retry(job_id: uuid.UUID, session: Session = Depends(get_session), user: User = Depends(current_user)):
+    owned(session, TranslationJob, job_id, user)
+    job = retry_job(session, job_id)
     return _job(job, _filename(session, job.document_id))
 
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobMessage } from "./api";
-import { mergeState, openEventStream, stopEventStream } from "./useEventStream";
+import { applySnapshot, mergeState, openEventStream, stopEventStream } from "./useEventStream";
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -85,9 +85,20 @@ describe("mergeState", () => {
     expect(mergeState(current, job(10, "done")).status).toBe("done");
   });
 
-  it("keeps a terminal status ahead of a later non-terminal message", () => {
-    const current = { status: "done", seq: 10, done_segments: 4, total_segments: 4, cost_cents: 3, error_code: null };
-    expect(mergeState(current, job(40, "translating"))).toBe(current);
+  it("keeps a finished or cancelled job ahead of a later non-terminal message", () => {
+    const done = { status: "done", seq: 10, done_segments: 4, total_segments: 4, cost_cents: 3, error_code: null };
+    expect(mergeState(done, job(40, "translating"))).toBe(done);
+    const cancelled = { ...done, status: "cancelled" };
+    expect(mergeState(cancelled, job(40, "translating"))).toBe(cancelled);
+  });
+
+  it("resumes a failed job when a later message leaves that status", () => {
+    const current = { status: "failed", seq: 10, done_segments: 1, total_segments: 4, cost_cents: 1, error_code: "rate_limited" as string | null };
+    const next = mergeState(current, job(40, "translating"));
+    expect(next.status).toBe("translating");
+    expect(next.error_code).toBeNull();
+    const listed = applySnapshot(current, { ...current, status: "translating", error_code: null, seq: 0 }, "job");
+    expect(listed.status).toBe("translating");
   });
 });
 

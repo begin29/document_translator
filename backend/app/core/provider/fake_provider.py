@@ -5,7 +5,7 @@ import re
 import time
 
 from app.config import get_settings
-from app.core.errors import InjectedCrash, ProviderFailure, ProviderTimeout, RateLimited
+from app.core.errors import FundsExceeded, InjectedCrash, ProviderFailure, ProviderTimeout, RateLimited
 from app.core.provider.base import TranslateRequest, TranslateResult
 
 _crashed_segments: set[int] = set()
@@ -46,7 +46,8 @@ class FakeProvider:
 
     def _maybe_fail(self, request: TranslateRequest, settings) -> None:
         mode = (settings.fake_fail_mode or "").strip()
-        if not mode or request.stage not in {"translate", "review"}:
+        stages = {"translate", "review", "summary"} if mode == "funds_exceeded" else {"translate", "review"}
+        if not mode or request.stage not in stages:
             return
         selected = _segments(settings.fake_fail_segments)
         if selected and request.segment_index not in selected:
@@ -61,6 +62,8 @@ class FakeProvider:
             raise ProviderTimeout("injected timeout")
         if mode == "rate_limit":
             raise RateLimited(0.05, "injected 429")
+        if mode == "funds_exceeded":
+            raise FundsExceeded("injected spend limit")
         if mode == "untranslated":
             return
 

@@ -2,11 +2,12 @@ import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { ApiError, DocumentRecord, EstimateModel, JobRecord, SegmentRecord, request } from "./api";
 import { AuthProvider, LoginPage, RegisterPage, RequireAuth, TokensPage, useAuth } from "./auth";
-import { errorMessage, progressLabel } from "./copy";
+import { errorMessage, progressLabel, sameNotice } from "./copy";
 import { applySnapshot, isTerminal, mergeState, useEventStream } from "./useEventStream";
 
 const rememberedJobs = new Map<string, JobRecord>();
 const DETAIL_STATUSES = new Set(["translating", "reviewing", "rendering", "done", "failed"]);
+const RETRYABLE = new Set(["rate_limited", "funds_exceeded", "provider_timeout", "provider_error"]);
 
 type CostReport = {
   stages: { stage: string; cost_cents: number; tokens_in: number; tokens_out: number }[];
@@ -72,7 +73,7 @@ function Shell({ children }: { children: ReactNode }) {
 function ErrorPanel({ code, detail }: { code?: string | null; detail?: string | null }) {
   if (!code && !detail) return null;
   const message = errorMessage(code, detail);
-  const extra = detail && detail !== message ? detail : null;
+  const extra = detail && !sameNotice(message, detail) ? detail : null;
   return (
     <div className="border border-stark-gold/60 bg-stark-ink px-4 py-3 text-sm text-stark-gold" role="alert">
       <div className="text-xs uppercase tracking-[0.18em]">Needs attention</div>
@@ -391,6 +392,8 @@ function JobPage() {
   const [segments, setSegments] = useState<SegmentRecord[]>([]);
   const [cost, setCost] = useState<CostReport | null>(null);
   const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const [retrying, setRetrying] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const idRef = useRef(id);
   idRef.current = id;
   const jobRef = useRef(job);
@@ -402,6 +405,8 @@ function JobPage() {
     setSegments([]);
     setCost(null);
     setDrafts({});
+    setRetrying(false);
+    setActionError(null);
   }, [id]);
 
   useEffect(() => {
@@ -458,6 +463,25 @@ function JobPage() {
     },
   });
 
+  async function retry() {
+    const jobId = idRef.current;
+    if (!jobId) return;
+    setRetrying(true);
+    setActionError(null);
+    try {
+      const next = await request<JobRecord>(`/api/jobs/${jobId}/retry`, { method: "POST" });
+      const resumed = { ...next, seq: Date.now() };
+      setJob(resumed);
+      rememberJob(resumed);
+      await loadDetails(jobId, resumed.status);
+    } catch (err) {
+      const failure = readFailure(err);
+      setActionError(errorMessage(failure.code, failure.detail));
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   async function save(blockIdx: number) {
     await request(`/api/jobs/${id}/segments/0`, {
       method: "PATCH",
@@ -489,6 +513,12 @@ function JobPage() {
       )}
       {job?.quality_warning && <p className="mt-3 text-sm text-stark-gold">A reviewer retranslated at least one segment because the first pass failed a quality check.</p>}
       {job?.error_code && <div className="mt-4"><ErrorPanel code={job.error_code} detail={job.error_detail} /></div>}
+      {job?.status === "failed" && job.error_code && RETRYABLE.has(job.error_code) && (
+        <button type="button" disabled={retrying} onClick={() => void retry()} className="mt-4 bg-stark-gold px-5 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-black disabled:opacity-50">
+          {retrying ? "Retrying" : "Retry"}
+        </button>
+      )}
+      {actionError && <p className="mt-3 text-sm text-stark-gold" role="alert">{actionError}</p>}
       {cost && (
         <ul className="mt-6 grid gap-2 sm:grid-cols-3">
           {cost.stages.map((stage) => (

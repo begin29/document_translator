@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.core.errors import FundsExceeded
 from app.core.prompts import PROMPT_VERSION, system_prompt, user_prompt
 from app.core.provider.base import TranslateRequest
 from app.core.quality import flags_for
@@ -35,6 +36,8 @@ def review_job(session: Session, job: TranslationJob, provider) -> bool:
     if _agent_enabled():
         try:
             ran = _run_agent(session, job, flagged, provider)
+        except FundsExceeded:
+            raise
         except Exception as exc:
             log.bind(job_id=str(job.id), stage="review").warning("review_agent_failed", error=str(exc))
             from app.core.service import _event

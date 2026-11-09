@@ -60,6 +60,17 @@ class RateLimited(AppError):
         self.retry_after = retry_after
 
 
+class FundsExceeded(AppError):
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(
+            "funds_exceeded",
+            "The translation account has reached its spend limit. Raise the limit or add funds, then retry.",
+            detail,
+            False,
+            402,
+        )
+
+
 class CostCapExceeded(AppError):
     def __init__(self, spent: str, cap: str) -> None:
         super().__init__(

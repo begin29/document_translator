@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 
 from app.config import get_settings
-from app.core.errors import ProviderFailure, ProviderTimeout, RateLimited
+from app.core.errors import FundsExceeded, ProviderFailure, ProviderTimeout, RateLimited
 from app.core.model_registry import resolve_model
 from app.core.provider.base import TranslateRequest, TranslateResult
+
+_FUNDS_CODES = frozenset({
+    "insufficient_quota",
+    "project_spend_limit_exceeded",
+    "billing_hard_limit_reached",
+    "billing_not_active",
+})
+_FUNDS_TYPES = frozenset({
+    "insufficient_quota",
+    "billing_limit_user_error",
+})
+_FUNDS_MARKERS = (
+    "insufficient_quota",
+    "project_spend_limit_exceeded",
+    "billing_hard_limit_reached",
+    "billing_not_active",
+    "spend limit",
+    "exceeded your current quota",
+    "billing hard limit",
+    "check your plan and billing",
+    "insufficient funds",
+)
 from app.core.tokenize import count_tokens
 
 
@@ -76,22 +99,66 @@ class OpenAIProvider:
         )
 
     def _raise_mapped(self, exc: Exception) -> None:
-        name = exc.__class__.__name__
-        status = getattr(exc, "status_code", None)
-        message = str(exc)
-        if status == 429 or "rate limit" in message.lower():
-            retry_after = 1.0
-            response = getattr(exc, "response", None)
-            if response is not None:
-                header = response.headers.get("retry-after")
-                if header:
-                    try:
-                        retry_after = float(header)
-                    except ValueError:
-                        retry_after = 1.0
-            raise RateLimited(retry_after, message) from exc
-        if status in {408, 504} or "timeout" in name.lower() or "timeout" in message.lower():
-            raise ProviderTimeout(message) from exc
-        if status is None or status >= 500:
-            raise ProviderFailure(message) from exc
-        raise ProviderFailure(message) from exc
+        raise_mapped(exc)
+
+
+def raise_mapped(exc: Exception) -> None:
+    status = getattr(exc, "status_code", None)
+    code, err_type, message = _error_parts(exc)
+    blob = f"{code}\n{err_type}\n{message}\n{exc}".lower()
+    if _is_funds(status, code, err_type, blob):
+        raise FundsExceeded(message) from exc
+    if status == 429 or code == "rate_limit_exceeded" or err_type in {"tokens", "requests"} or "rate limit" in message.lower():
+        raise RateLimited(_retry_after(exc), message) from exc
+    name = exc.__class__.__name__
+    if status in {408, 504} or "timeout" in name.lower() or "timeout" in message.lower():
+        raise ProviderTimeout(message) from exc
+    raise ProviderFailure(message) from exc
+
+
+def _is_funds(status: int | None, code: str, err_type: str, blob: str) -> bool:
+    if status == 402 or code in _FUNDS_CODES or err_type in _FUNDS_TYPES:
+        return True
+    return any(marker in blob for marker in _FUNDS_MARKERS)
+
+
+def _error_parts(exc: Exception) -> tuple[str, str, str]:
+    message = str(exc)
+    code = ""
+    err_type = ""
+    body = getattr(exc, "body", None)
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            body = None
+    if isinstance(body, dict):
+        error = body.get("error") if isinstance(body.get("error"), dict) else body
+        if isinstance(error, dict):
+            raw_code = error.get("code")
+            raw_type = error.get("type")
+            raw_message = error.get("message")
+            if isinstance(raw_code, str):
+                code = raw_code
+            if isinstance(raw_type, str):
+                err_type = raw_type
+            if isinstance(raw_message, str) and raw_message:
+                message = raw_message
+    if not code:
+        raw = getattr(exc, "code", None)
+        if isinstance(raw, str):
+            code = raw
+    return code.lower(), err_type.lower(), message
+
+
+def _retry_after(exc: Exception) -> float:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return 1.0
+    header = response.headers.get("retry-after")
+    if not header:
+        return 1.0
+    try:
+        return float(header)
+    except (TypeError, ValueError):
+        return 1.0

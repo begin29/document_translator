@@ -12,7 +12,7 @@ from sqlalchemy import text
 from app.config import get_settings
 from app.core.errors import AppError
 from app.core.provider.fake_provider import reset_crash_memory
-from app.core.service import cancel_job, create_document, create_job, debug_provider_calls, process_available, reap, reset_runtime, run_analysis, sync_gate
+from app.core.service import cancel_job, create_document, create_job, debug_provider_calls, process_available, reap, reset_runtime, retry_job, run_analysis, sync_gate
 from app.db.models import ProviderCall, TranslationJob
 from app.db.session import reset_engine, session_factory
 
@@ -179,6 +179,90 @@ def test_crash_resume_skips_done_segments(session, tmp_path, monkeypatch, make_u
     done_after = session.query(ProviderCall).filter(ProviderCall.job_id == job.id, ProviderCall.stage == "translate", ProviderCall.status == "ok").count()
     assert done_after >= done_before
     assert done_before >= 1
+
+
+def test_retry_resumes_unfinished_segments(session, tmp_path, monkeypatch, make_user):
+    from sqlalchemy import select
+
+    from app.db.models import Segment
+
+    monkeypatch.setenv("FAKE_FAIL_MODE", "timeout")
+    monkeypatch.setenv("FAKE_FAIL_SEGMENTS", "1")
+    monkeypatch.setenv("GLOBAL_QUALITY_CAP", "32")
+    get_settings.cache_clear()
+    owner = make_user()
+    path = tmp_path / "resume.pdf"
+    words = " ".join(["alpha"] * 40)
+    _pdf(path, [f"{words} {i}." for i in range(4)])
+    document = create_document(session, path.read_bytes(), "resume.pdf", owner.id)
+    session.commit()
+    run_analysis(session, document.id)
+    session.commit()
+    job = create_job(session, document.id, "de", None, None, None, None)
+    session.commit()
+    _drain(session)
+    session.refresh(job)
+    assert job.status == "failed"
+    assert job.error_code == "provider_timeout"
+    done_ids = [row.id for row in session.scalars(select(Segment).where(Segment.job_id == job.id, Segment.status == "done"))]
+    failed = session.scalars(select(Segment).where(Segment.job_id == job.id, Segment.status == "failed")).all()
+    assert done_ids
+    assert failed
+    ok_before = session.query(ProviderCall).filter(ProviderCall.segment_id.in_(done_ids), ProviderCall.status == "ok").count()
+    monkeypatch.setenv("FAKE_FAIL_MODE", "")
+    get_settings.cache_clear()
+    retry_job(session, job.id)
+    session.commit()
+    session.refresh(job)
+    assert job.status == "translating"
+    assert job.error_code is None
+    for segment in failed:
+        session.refresh(segment)
+        assert segment.status == "pending"
+        assert segment.attempt == 0
+    _drain(session)
+    session.refresh(job)
+    assert job.status == "done"
+    ok_after = session.query(ProviderCall).filter(ProviderCall.segment_id.in_(done_ids), ProviderCall.status == "ok").count()
+    assert ok_after == ok_before
+    with pytest.raises(AppError) as exc:
+        retry_job(session, job.id)
+    assert exc.value.code == "not_retryable"
+
+
+def test_funds_exceeded_stops_without_backoff(session, tmp_path, monkeypatch, make_user):
+    monkeypatch.setenv("FAKE_FAIL_MODE", "funds_exceeded")
+    get_settings.cache_clear()
+    owner = make_user()
+    path = tmp_path / "funds.pdf"
+    _pdf(path, ["This document should stop when the provider account is out of funds."])
+    document = create_document(session, path.read_bytes(), "funds.pdf", owner.id)
+    session.commit()
+    run_analysis(session, document.id)
+    session.commit()
+    job = create_job(session, document.id, "de", None, None, None, None)
+    session.commit()
+    _drain(session)
+    session.refresh(job)
+    assert job.status == "failed"
+    assert job.error_code == "funds_exceeded"
+    errors = session.query(ProviderCall).filter(ProviderCall.job_id == job.id, ProviderCall.error_code == "funds_exceeded").all()
+    assert len(errors) == 1
+    assert errors[0].stage == "summary"
+    assert session.query(ProviderCall).filter(ProviderCall.job_id == job.id, ProviderCall.error_code == "rate_limited").count() == 0
+    gate = session.execute(text("SELECT last_429_at, effective_max, ceiling FROM provider_gate WHERE id = 1")).one()
+    assert gate.last_429_at is None
+    assert gate.effective_max == gate.ceiling
+    monkeypatch.setenv("FAKE_FAIL_MODE", "")
+    get_settings.cache_clear()
+    retry_job(session, job.id)
+    session.commit()
+    session.refresh(job)
+    assert job.status == "queued"
+    assert job.error_code is None
+    _drain(session)
+    session.refresh(job)
+    assert job.status == "done"
 
 
 def test_debug_inflight_shape(session):
