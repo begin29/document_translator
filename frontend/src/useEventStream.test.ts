@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobMessage } from "./api";
-import { applySnapshot, mergeState, openEventStream, stopEventStream } from "./useEventStream";
+import { applySnapshot, mergeJobRecord, mergeState, openEventStream, stopEventStream } from "./useEventStream";
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -100,6 +100,25 @@ describe("mergeState", () => {
     const listed = applySnapshot(current, { ...current, status: "translating", error_code: null, seq: 0 }, "job");
     expect(listed.status).toBe("translating");
   });
+
+  it("keeps newer segment progress when a rest snapshot is behind", () => {
+    const current = { status: "translating", seq: 40, done_segments: 6, total_segments: 10, cost_cents: 4, error_code: null };
+    const incoming = { status: "queued", seq: 0, done_segments: 0, total_segments: 0, cost_cents: 0, error_code: null };
+    const next = mergeJobRecord(current, incoming);
+    expect(next.status).toBe("translating");
+    expect(next.done_segments).toBe(6);
+    expect(next.total_segments).toBe(10);
+    expect(next.seq).toBe(40);
+  });
+
+  it("accepts a later rest snapshot that has moved further", () => {
+    const current = { status: "translating", seq: 40, done_segments: 2, total_segments: 10, cost_cents: 1, error_code: null };
+    const incoming = { status: "reviewing", done_segments: 8, total_segments: 10, cost_cents: 3, error_code: null };
+    const next = mergeJobRecord(current, incoming);
+    expect(next.status).toBe("reviewing");
+    expect(next.done_segments).toBe(8);
+    expect(next.cost_cents).toBe(3);
+  });
 });
 
 describe("openEventStream", () => {
@@ -112,11 +131,29 @@ describe("openEventStream", () => {
       await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
       const source = FakeEventSource.instances[0];
       expect(source.url).toBe("/events?ticket=a%20b");
+      expect(fetchState).toHaveBeenCalledTimes(1);
       source.emit("subscribed");
       source.emit("resync");
-      expect(fetchState).toHaveBeenCalledTimes(2);
+      expect(fetchState).toHaveBeenCalledTimes(3);
     } finally {
       session.close();
+    }
+  });
+
+  it("loads state when a listener joins an open stream", async () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    mockTicket(["shared"]);
+    const firstFetch = vi.fn();
+    const first = openEventStream({ fetchState: firstFetch, onMessage: () => undefined });
+    try {
+      await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const secondFetch = vi.fn();
+      const second = openEventStream({ fetchState: secondFetch, onMessage: () => undefined });
+      expect(secondFetch).toHaveBeenCalledTimes(1);
+      expect(FakeEventSource.instances).toHaveLength(1);
+      second.close();
+    } finally {
+      first.close();
     }
   });
 

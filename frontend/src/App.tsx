@@ -1,26 +1,74 @@
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
-import { ApiError, DocumentRecord, EstimateModel, JobRecord, SegmentRecord, request } from "./api";
+import { ApiError, DocumentRecord, EstimateModel, JobMessage, JobRecord, SegmentRecord, request } from "./api";
 import { AuthProvider, LoginPage, RegisterPage, RequireAuth, TokensPage, useAuth } from "./auth";
-import { errorMessage, progressLabel, sameNotice } from "./copy";
-import { applySnapshot, isTerminal, mergeState, useEventStream } from "./useEventStream";
+import { errorMessage, progressLabel, progressRatio, sameNotice } from "./copy";
+import { applySnapshot, isTerminal, mergeJobRecord, mergeState, useEventStream } from "./useEventStream";
 
 const rememberedJobs = new Map<string, JobRecord>();
-const DETAIL_STATUSES = new Set(["translating", "reviewing", "rendering", "done", "failed"]);
 const RETRYABLE = new Set(["rate_limited", "funds_exceeded", "provider_timeout", "provider_error"]);
 
 type CostReport = {
   stages: { stage: string; cost_cents: number; tokens_in: number; tokens_out: number }[];
 };
 
-function adoptJobs(prev: Map<string, JobRecord>, rows: JobRecord[]): Map<string, JobRecord> {
-  const next = new Map<string, JobRecord>();
-  for (const row of rows) {
-    next.set(row.id, applySnapshot(prev.get(row.id) ?? rememberedJobs.get(row.id), row, "job"));
-  }
+const HISTORY_PAGE = 10;
+
+function snapshotJob(prev: Map<string, JobRecord>, row: JobRecord): JobRecord {
+  return applySnapshot(prev.get(row.id) ?? rememberedJobs.get(row.id), row, "job");
+}
+
+function storeJobs(next: Map<string, JobRecord>): Map<string, JobRecord> {
   rememberedJobs.clear();
   for (const job of next.values()) rememberedJobs.set(job.id, job);
   return next;
+}
+
+function adoptJobs(prev: Map<string, JobRecord>, rows: JobRecord[]): Map<string, JobRecord> {
+  const next = new Map<string, JobRecord>();
+  for (const row of rows) next.set(row.id, snapshotJob(prev, row));
+  return storeJobs(next);
+}
+
+function appendJobs(prev: Map<string, JobRecord>, rows: JobRecord[]): Map<string, JobRecord> {
+  const next = new Map(prev);
+  for (const row of rows) next.set(row.id, snapshotJob(prev, row));
+  return storeJobs(next);
+}
+
+function refreshJobs(prev: Map<string, JobRecord>, rows: JobRecord[]): Map<string, JobRecord> {
+  const incoming = new Map(rows.map((row) => [row.id, snapshotJob(prev, row)]));
+  const next = new Map<string, JobRecord>();
+  for (const job of incoming.values()) {
+    if (!prev.has(job.id)) next.set(job.id, job);
+  }
+  for (const [id, job] of prev) next.set(id, incoming.get(id) ?? job);
+  return storeJobs(next);
+}
+
+function takeJobs(source: Iterable<JobRecord>, count: number): Map<string, JobRecord> {
+  const next = new Map<string, JobRecord>();
+  for (const job of source) {
+    next.set(job.id, job);
+    if (next.size >= count) break;
+  }
+  return next;
+}
+
+function historyCursor(jobs: Map<string, JobRecord>): { before: string; before_id: string } | null {
+  let oldest: JobRecord | null = null;
+  for (const job of jobs.values()) {
+    if (!job.created_at) continue;
+    if (!oldest?.created_at) {
+      oldest = job;
+      continue;
+    }
+    const jobTime = Date.parse(job.created_at);
+    const oldestTime = Date.parse(oldest.created_at);
+    if (jobTime < oldestTime || (jobTime === oldestTime && job.id < oldest.id)) oldest = job;
+  }
+  if (!oldest?.created_at) return null;
+  return { before: oldest.created_at, before_id: oldest.id };
 }
 
 function rememberJob(job: JobRecord) {
@@ -86,14 +134,20 @@ function ErrorPanel({ code, detail }: { code?: string | null; detail?: string | 
 
 function Home() {
   const navigate = useNavigate();
-  const [jobs, setJobs] = useState<Map<string, JobRecord>>(() => new Map(rememberedJobs));
+  const [jobs, setJobs] = useState<Map<string, JobRecord>>(() => takeJobs(rememberedJobs.values(), HISTORY_PAGE));
   const [maxUploadMb, setMaxUploadMb] = useState<number | null>(null);
   const [error, setError] = useState<{ code?: string; detail?: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [historyReady, setHistoryReady] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const mounted = useRef(true);
   const jobsRef = useRef(jobs);
   jobsRef.current = jobs;
-  const unknownFlight = useRef<Promise<void> | null>(null);
+  const hasMoreRef = useRef(true);
+  const loadingRef = useRef(false);
+  const sentinelRef = useRef<HTMLLIElement | null>(null);
+  const loadRef = useRef<(mode: "replace" | "append" | "refresh") => Promise<void>>(async () => undefined);
 
   useEffect(() => {
     mounted.current = true;
@@ -116,43 +170,74 @@ function Home() {
     };
   }, []);
 
-  useEffect(() => {
-    let stop = false;
-    request<JobRecord[]>("/api/jobs")
-      .then((rows) => {
-        if (!stop) setJobs((prev) => adoptJobs(prev, rows));
-      })
-      .catch(() => undefined);
-    return () => {
-      stop = true;
-    };
-  }, []);
-
-  function refreshUnknown() {
-    if (unknownFlight.current) return;
-    const run = request<JobRecord[]>("/api/jobs")
-      .then((rows) => {
-        if (!mounted.current) return;
-        setJobs((prev) => adoptJobs(prev, rows));
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        unknownFlight.current = null;
+  async function loadHistory(mode: "replace" | "append" | "refresh") {
+    if (!mounted.current || loadingRef.current) return;
+    if (mode === "append" && !hasMoreRef.current) return;
+    const params = new URLSearchParams({ limit: String(HISTORY_PAGE) });
+    if (mode === "append") {
+      const cursor = historyCursor(jobsRef.current);
+      if (!cursor) {
+        hasMoreRef.current = false;
+        setHasMore(false);
+        return;
+      }
+      params.set("before", cursor.before);
+      params.set("before_id", cursor.before_id);
+    }
+    loadingRef.current = true;
+    if (mode === "append") setLoadingMore(true);
+    try {
+      const rows = await request<JobRecord[]>(`/api/jobs?${params.toString()}`);
+      if (!mounted.current) return;
+      const known = new Set(jobsRef.current.keys());
+      const added = rows.reduce((count, row) => count + (known.has(row.id) ? 0 : 1), 0);
+      setJobs((prev) => {
+        const next = mode === "append" ? appendJobs(prev, rows) : mode === "refresh" ? refreshJobs(prev, rows) : adoptJobs(prev, rows);
+        jobsRef.current = next;
+        return next;
       });
-    unknownFlight.current = run;
+      if (mode !== "refresh") {
+        const more = rows.length === HISTORY_PAGE && (mode === "replace" || added > 0);
+        hasMoreRef.current = more;
+        setHasMore(more);
+      }
+    } catch {
+      if (mode === "append" && mounted.current) {
+        hasMoreRef.current = false;
+        setHasMore(false);
+      }
+    } finally {
+      loadingRef.current = false;
+      if (mounted.current) {
+        setHistoryReady(true);
+        setLoadingMore(false);
+      }
+    }
   }
 
+  loadRef.current = loadHistory;
+
+  useEffect(() => {
+    void loadRef.current("replace");
+  }, []);
+
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node || !hasMore || !historyReady) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void loadRef.current("append");
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasMore, historyReady, jobs.size]);
+
   useEventStream({
-    fetchState: async () => {
-      const rows = await request<JobRecord[]>("/api/jobs");
-      if (!mounted.current) return;
-      setJobs((prev) => adoptJobs(prev, rows));
-    },
+    fetchState: () => loadRef.current("refresh"),
     onMessage: (msg) => {
       if (msg.type !== "job") return;
       const existing = jobsRef.current.get(msg.id);
       if (!existing) {
-        refreshUnknown();
+        void loadRef.current("refresh");
         return;
       }
       setJobs((prev) => {
@@ -209,7 +294,7 @@ function Home() {
       </form>
       <h2 className="mt-12 text-xs uppercase tracking-[0.22em] text-stark-gray">History</h2>
       <ul className="mt-4 divide-y divide-white/10 border border-white/10">
-        {history.length === 0 && <li className="px-4 py-6 text-sm text-stark-gray">No translations yet.</li>}
+        {historyReady && history.length === 0 && <li className="px-4 py-6 text-sm text-stark-gray">No translations yet.</li>}
         {history.map((job) => {
           const stamp = formatStamp(job.created_at);
           const title = job.document_filename || "Untitled document";
@@ -225,6 +310,11 @@ function Home() {
             </li>
           );
         })}
+        {historyReady && hasMore && history.length > 0 && (
+          <li ref={sentinelRef} className="px-4 py-3 text-center text-xs uppercase tracking-[0.16em] text-stark-gray" aria-live="polite">
+            {loadingMore ? "Loading" : ""}
+          </li>
+        )}
       </ul>
     </Shell>
   );
@@ -251,6 +341,7 @@ function DocumentPage() {
     setDocument(null);
     setQuotes(null);
     setError(null);
+    void refreshDocument().catch(() => undefined);
   }, [id]);
 
   useEffect(() => {
@@ -312,12 +403,20 @@ function DocumentPage() {
 
   const lines = document?.analysis?.class_lines || [];
   const poor = (document?.analysis?.pages || []).filter((page) => page.class === "scanned_poor" && page.thumbnail);
+  const analyzing = document?.analysis_status !== "ready" && document?.analysis_status !== "failed";
+  const heading = document?.analysis_status === "failed" ? "Analysis failed" : analyzing ? "Analyzing the document" : "Price before you translate";
   return (
     <Shell>
       <p className="text-xs uppercase tracking-[0.22em] text-stark-gray">{document?.filename || "Analyzing"}</p>
-      <h1 className="mt-2 text-3xl font-semibold">Price before you translate</h1>
-      {document?.analysis_status !== "ready" && document?.analysis_status !== "failed" && (
-        <p className="mt-6 text-stark-gray">Reading pages and classifying each one.</p>
+      <h1 className="mt-2 text-3xl font-semibold">{heading}</h1>
+      {analyzing && (
+        <div className="mt-6" role="status" aria-live="polite" aria-busy="true">
+          <p className="text-xs uppercase tracking-[0.22em] text-stark-gold">Analyzing</p>
+          <div className="mt-4 h-2 overflow-hidden bg-white/10" role="progressbar" aria-label="Analyzing the document">
+            <div className="h-2 w-2/5 animate-indeterminate bg-stark-gold" />
+          </div>
+          <p className="mt-3 text-sm text-stark-gray">Reading pages and classifying each one.</p>
+        </div>
       )}
       {document?.analysis_status === "failed" && <div className="mt-6"><ErrorPanel code={document.error_code} detail={document.error_detail} /></div>}
       {error && <div className="mt-6"><ErrorPanel code={error.code} detail={error.detail} /></div>}
@@ -386,80 +485,137 @@ function DocumentPage() {
   );
 }
 
+function adoptJob(current: JobRecord | null, incoming: JobRecord, pending: JobMessage | null): JobRecord {
+  const base = mergeJobRecord(current, incoming);
+  if (!pending || pending.id !== incoming.id) return base;
+  const merged = mergeState(base, pending);
+  return {
+    ...merged,
+    done_segments: Math.max(base.done_segments || 0, merged.done_segments || 0),
+    total_segments: Math.max(base.total_segments || 0, merged.total_segments || 0),
+    cost_cents: Math.max(base.cost_cents || 0, merged.cost_cents || 0),
+  };
+}
+
+function applyJobEvent(current: JobRecord, msg: JobMessage): JobRecord {
+  const merged = mergeState(current, msg);
+  if (merged === current) return current;
+  return {
+    ...merged,
+    done_segments: Math.max(current.done_segments || 0, merged.done_segments || 0),
+    total_segments: Math.max(current.total_segments || 0, merged.total_segments || 0),
+    cost_cents: Math.max(current.cost_cents || 0, merged.cost_cents || 0),
+  };
+}
+
+function pendingEdits(segments: SegmentRecord[], drafts: Record<number, string>) {
+  const edits: { block_idx: number; text: string }[] = [];
+  for (const segment of segments) {
+    for (const block of segment.blocks) {
+      if (block.kind === "image") continue;
+      const draft = drafts[block.block_idx];
+      if (draft === undefined || draft === (block.target ?? "")) continue;
+      edits.push({ block_idx: block.block_idx, text: draft });
+    }
+  }
+  return edits;
+}
+
 function JobPage() {
   const { id } = useParams();
-  const [job, setJob] = useState<JobRecord | null>(null);
+  const [job, setJob] = useState<JobRecord | null>(() => (id ? rememberedJobs.get(id) ?? null : null));
   const [segments, setSegments] = useState<SegmentRecord[]>([]);
   const [cost, setCost] = useState<CostReport | null>(null);
   const [drafts, setDrafts] = useState<Record<number, string>>({});
   const [retrying, setRetrying] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savedNote, setSavedNote] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [compared, setCompared] = useState(false);
   const idRef = useRef(id);
   idRef.current = id;
   const jobRef = useRef(job);
   jobRef.current = job;
-  const detailTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingEvent = useRef<JobMessage | null>(null);
+  const jobGen = useRef(0);
+  const appliedGen = useRef(0);
+  const detailsFlight = useRef<string | null>(null);
+  const comparedRef = useRef(false);
+  comparedRef.current = compared;
 
   useEffect(() => {
-    setJob(null);
+    setJob(id ? rememberedJobs.get(id) ?? null : null);
     setSegments([]);
     setCost(null);
     setDrafts({});
     setRetrying(false);
+    setSaving(false);
+    setSavedNote(null);
     setActionError(null);
+    setCompared(false);
+    pendingEvent.current = null;
+    jobGen.current = 0;
+    appliedGen.current = 0;
+    detailsFlight.current = null;
+    void refreshJob();
   }, [id]);
 
   useEffect(() => {
-    return () => {
-      if (detailTimer.current) clearTimeout(detailTimer.current);
-    };
+    if (!id) return;
+    const timer = setInterval(() => {
+      const status = jobRef.current?.status;
+      if (status && isTerminal("job", status) && (status !== "done" || comparedRef.current)) return;
+      void refreshJob();
+    }, 1000);
+    return () => clearInterval(timer);
   }, [id]);
 
-  async function loadDetails(jobId: string, status: string) {
-    if (!DETAIL_STATUSES.has(status)) return;
-    const [nextSegments, nextCost] = await Promise.all([
-      request<SegmentRecord[]>(`/api/jobs/${jobId}/segments`),
-      request<CostReport>(`/api/jobs/${jobId}/cost`),
-    ]);
-    if (idRef.current !== jobId) return;
-    setSegments(nextSegments);
-    setCost(nextCost);
+  async function loadDetails(jobId: string) {
+    if (detailsFlight.current === jobId) return;
+    detailsFlight.current = jobId;
+    try {
+      const [nextSegments, nextCost] = await Promise.all([
+        request<SegmentRecord[]>(`/api/jobs/${jobId}/segments`),
+        request<CostReport>(`/api/jobs/${jobId}/cost`),
+      ]);
+      if (idRef.current !== jobId) return;
+      setSegments(nextSegments);
+      setCost(nextCost);
+      setCompared(true);
+    } finally {
+      if (detailsFlight.current === jobId) detailsFlight.current = null;
+    }
   }
 
   async function refreshJob() {
     const jobId = idRef.current;
     if (!jobId) return;
-    const next = await request<JobRecord>(`/api/jobs/${jobId}`);
-    if (idRef.current !== jobId) return;
-    setJob((current) => applySnapshot(current ?? undefined, next, "job"));
-    await loadDetails(jobId, next.status);
-  }
-
-  function scheduleDetails() {
-    if (detailTimer.current) clearTimeout(detailTimer.current);
-    detailTimer.current = setTimeout(() => {
-      detailTimer.current = null;
-      const current = jobRef.current;
-      const jobId = idRef.current;
-      if (!current || !jobId) return;
-      void loadDetails(jobId, current.status);
-    }, 1000);
+    const gen = ++jobGen.current;
+    try {
+      const next = await request<JobRecord>(`/api/jobs/${jobId}`);
+      if (idRef.current !== jobId || gen < appliedGen.current) return;
+      appliedGen.current = gen;
+      const pending = pendingEvent.current?.id === jobId ? pendingEvent.current : null;
+      pendingEvent.current = null;
+      setJob((current) => adoptJob(current, next, pending));
+      if (next.status === "done" || pending?.status === "done") await loadDetails(jobId);
+    } catch {
+      return;
+    }
   }
 
   useEventStream({
     fetchState: refreshJob,
     onMessage: (msg) => {
       if (msg.type !== "job" || msg.id !== idRef.current) return;
-      setJob((current) => (current ? mergeState(current, msg) : current));
-      if (isTerminal("job", msg.status)) {
-        if (detailTimer.current) {
-          clearTimeout(detailTimer.current);
-          detailTimer.current = null;
+      setJob((current) => {
+        if (!current) {
+          pendingEvent.current = msg;
+          return current;
         }
-        void refreshJob();
-        return;
-      }
-      scheduleDetails();
+        return applyJobEvent(current, msg);
+      });
+      if (isTerminal("job", msg.status)) void refreshJob();
     },
   });
 
@@ -468,12 +624,13 @@ function JobPage() {
     if (!jobId) return;
     setRetrying(true);
     setActionError(null);
+    setCompared(false);
+    setSegments([]);
     try {
       const next = await request<JobRecord>(`/api/jobs/${jobId}/retry`, { method: "POST" });
       const resumed = { ...next, seq: Date.now() };
       setJob(resumed);
       rememberJob(resumed);
-      await loadDetails(jobId, resumed.status);
     } catch (err) {
       const failure = readFailure(err);
       setActionError(errorMessage(failure.code, failure.detail));
@@ -482,26 +639,62 @@ function JobPage() {
     }
   }
 
-  async function save(blockIdx: number) {
-    await request(`/api/jobs/${id}/segments/0`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ block_idx: blockIdx, text: drafts[blockIdx] }),
-    });
-    setSegments(await request<SegmentRecord[]>(`/api/jobs/${id}/segments`));
+  const edits = pendingEdits(segments, drafts);
+
+  async function saveEdits() {
+    const jobId = idRef.current;
+    const snapshot = pendingEdits(segments, drafts);
+    if (!jobId || snapshot.length === 0) return;
+    setSaving(true);
+    setActionError(null);
+    setSavedNote(null);
+    try {
+      await request(`/api/jobs/${jobId}/edits`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ edits: snapshot }),
+      });
+      const saved = new Map(snapshot.map((edit) => [edit.block_idx, edit.text]));
+      setSegments((current) =>
+        current.map((segment) => ({
+          ...segment,
+          blocks: segment.blocks.map((block) => {
+            const text = saved.get(block.block_idx);
+            return text === undefined ? block : { ...block, target: text, origin: "user" };
+          }),
+        })),
+      );
+      setDrafts((current) => {
+        const next = { ...current };
+        for (const edit of snapshot) {
+          if (next[edit.block_idx] === edit.text) delete next[edit.block_idx];
+        }
+        return next;
+      });
+      setSavedNote("Changes saved. Download the file again to include them.");
+      await refreshJob();
+    } catch (err) {
+      const failure = readFailure(err);
+      setActionError(errorMessage(failure.code, failure.detail));
+    } finally {
+      setSaving(false);
+    }
   }
 
-  const ratio = job && job.total_segments ? Math.round((job.done_segments / job.total_segments) * 100) : job?.status === "done" ? 100 : 8;
+  const ratio = job ? progressRatio(job.done_segments, job.total_segments, job.status) : 6;
+  const label = job ? progressLabel(job.done_segments, job.total_segments, job.status) : "Loading";
+  const showCompare = job?.status === "done" && compared;
+  const showLoader = !job || (job.status !== "failed" && job.status !== "cancelled" && !showCompare);
   return (
     <Shell>
       {job?.document_filename && (
         <h1 className="truncate text-2xl font-semibold" title={job.document_filename}>{job.document_filename}</h1>
       )}
       <p className={`${job?.document_filename ? "mt-2" : ""} text-xs uppercase tracking-[0.22em] text-stark-gold`}>
-        {job ? progressLabel(job.done_segments, job.total_segments, job.status) : "Loading"}
+        {label}
       </p>
-      <div className="mt-4 h-1 bg-white/10">
-        <div className="h-1 bg-stark-gold" style={{ width: `${Math.min(ratio, 100)}%` }} />
+      <div className="mt-4 h-1 overflow-hidden bg-white/10" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={ratio} aria-label={label}>
+        <div className="h-1 bg-stark-gold transition-[width] duration-500 ease-out" style={{ width: `${ratio}%` }} />
       </div>
       {job && (
         <p className="mt-3 text-sm text-stark-gray">
@@ -518,8 +711,8 @@ function JobPage() {
           {retrying ? "Retrying" : "Retry"}
         </button>
       )}
-      {actionError && <p className="mt-3 text-sm text-stark-gold" role="alert">{actionError}</p>}
-      {cost && (
+      {actionError && job?.status !== "done" && <p className="mt-3 text-sm text-stark-gold" role="alert">{actionError}</p>}
+      {showCompare && cost && (
         <ul className="mt-6 grid gap-2 sm:grid-cols-3">
           {cost.stages.map((stage) => (
             <li key={stage.stage} className="border border-white/10 p-3 text-sm">
@@ -529,9 +722,18 @@ function JobPage() {
           ))}
         </ul>
       )}
-      {job?.status === "done" && (
-        <a className="mt-6 inline-block border border-stark-gold px-4 py-2 text-sm uppercase tracking-[0.16em] text-stark-gold" href={`/api/jobs/${id}/download`}>Download</a>
+      {showLoader && (
+        <div className="mt-8 border border-white/10 px-6 py-12" role="status" aria-live="polite" aria-busy="true">
+          <div className="flex items-center gap-4">
+            <span className="h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-white/15 border-t-stark-gold" />
+            <div>
+              <p className="text-xs uppercase tracking-[0.18em] text-stark-gold">{job?.status || "Loading"}</p>
+              <p className="mt-2 text-sm text-stark-gray">{label}</p>
+            </div>
+          </div>
+        </div>
       )}
+      {showCompare && (
       <div className="mt-8 space-y-4">
         {segments.map((segment) => (
           <article key={segment.idx} className="border border-white/10">
@@ -546,15 +748,34 @@ function JobPage() {
                   <textarea
                     className="h-28 w-full bg-transparent text-sm outline-none"
                     value={drafts[block.block_idx] ?? block.target ?? ""}
-                    onChange={(event) => setDrafts({ ...drafts, [block.block_idx]: event.target.value })}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setSavedNote(null);
+                      setDrafts((current) => ({ ...current, [block.block_idx]: value }));
+                    }}
                   />
-                  <button className="text-xs uppercase tracking-[0.16em] text-stark-gold" onClick={() => save(block.block_idx)}>Save edit</button>
                 </div>
               </div>
             ))}
           </article>
         ))}
       </div>
+      )}
+      {showCompare && (
+        <div className="mt-8 flex flex-wrap items-center gap-4">
+          <button
+            type="button"
+            disabled={saving || edits.length === 0}
+            onClick={() => void saveEdits()}
+            className="bg-stark-gold px-5 py-2 text-sm font-semibold uppercase tracking-[0.16em] text-black disabled:opacity-50"
+          >
+            {saving ? "Saving" : "Save changes"}
+          </button>
+          <a className="inline-block border border-stark-gold px-4 py-2 text-sm uppercase tracking-[0.16em] text-stark-gold" href={`/api/jobs/${id}/download`}>Download</a>
+          {savedNote && <p className="text-sm text-stark-gray">{savedNote}</p>}
+          {actionError && <p className="text-sm text-stark-gold" role="alert">{actionError}</p>}
+        </div>
+      )}
     </Shell>
   );
 }

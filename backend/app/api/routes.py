@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Header, UploadFile
+from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.auth.deps import current_user, get_session, require_admin
@@ -23,6 +24,7 @@ from app.core.service import (
     create_job,
     debug_provider_calls,
     edit_translation,
+    edit_translations,
     estimate_for,
     public_estimate,
     render_job,
@@ -45,6 +47,10 @@ class JobIn(BaseModel):
 class EditIn(BaseModel):
     block_idx: int
     text: str
+
+
+class EditsIn(BaseModel):
+    edits: list[EditIn]
 
 
 def owned(session: Session, model, ident: uuid.UUID, user: User):
@@ -180,14 +186,28 @@ def document_estimate(
 
 
 @router.get("/jobs")
-def list_jobs(session: Session = Depends(get_session), user: User = Depends(current_user)):
-    rows = session.execute(
+def list_jobs(
+    limit: int = Query(default=100, ge=1, le=100),
+    before: datetime | None = None,
+    before_id: uuid.UUID | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    statement = (
         select(TranslationJob, Document.filename)
         .join(Document, Document.id == TranslationJob.document_id)
         .where(TranslationJob.owner_id == user.id)
-        .order_by(TranslationJob.created_at.desc())
-        .limit(100)
-    ).all()
+        .order_by(TranslationJob.created_at.desc(), TranslationJob.id.desc())
+        .limit(limit)
+    )
+    if before is not None and before_id is not None:
+        statement = statement.where(
+            or_(
+                TranslationJob.created_at < before,
+                and_(TranslationJob.created_at == before, TranslationJob.id < before_id),
+            )
+        )
+    rows = session.execute(statement).all()
     return [_job(job, filename) for job, filename in rows]
 
 
@@ -249,6 +269,18 @@ def read_segments(job_id: uuid.UUID, session: Session = Depends(get_session), us
             }
         )
     return payload
+
+
+@router.patch("/jobs/{job_id}/edits")
+def patch_edits(
+    job_id: uuid.UUID,
+    body: EditsIn,
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+):
+    owned(session, TranslationJob, job_id, user)
+    edit_translations(session, job_id, [(item.block_idx, item.text) for item in body.edits])
+    return {"ok": True}
 
 
 @router.patch("/jobs/{job_id}/segments/{segment_idx}")

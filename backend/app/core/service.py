@@ -520,17 +520,32 @@ def cancel_job(session: Session, job_id: uuid.UUID) -> TranslationJob:
 
 
 def edit_translation(session: Session, job_id: uuid.UUID, block_idx: int, text: str) -> None:
+    edit_translations(session, job_id, [(block_idx, text)])
+
+
+def edit_translations(session: Session, job_id: uuid.UUID, edits: list[tuple[int, str]]) -> None:
     job = session.get(TranslationJob, job_id)
     if job is None:
         raise AppError("not_found", "Job not found.", str(job_id), False, 404)
-    row = session.get(BlockTranslation, (job_id, block_idx))
-    if row is None:
-        session.add(BlockTranslation(job_id=job_id, block_idx=block_idx, tgt_text=text, source="user"))
-    else:
-        row.tgt_text = text
-        row.source = "user"
+    if not edits:
+        raise AppError("invalid_edit", "There are no changes to save.", "", False, 400)
+    if job.status != "done":
+        raise AppError("not_ready", "Save edits after the translation finishes.", job.status, False, 409)
+    indexes = [block_idx for block_idx, _text in edits]
+    blocks = session.scalars(select(Block).where(Block.document_id == job.document_id, Block.idx.in_(indexes))).all()
+    by_idx = {block.idx: block for block in blocks}
+    for block_idx, text in edits:
+        block = by_idx.get(block_idx)
+        if block is None or block.kind == "image":
+            raise AppError("invalid_edit", "That passage is not part of this translation.", str(block_idx), False, 400)
+        row = session.get(BlockTranslation, (job_id, block_idx))
+        if row is None:
+            session.add(BlockTranslation(job_id=job_id, block_idx=block_idx, tgt_text=text, source="user"))
+        else:
+            row.tgt_text = text
+            row.source = "user"
+        _event(session, job.id, "translation_edited", {"block_idx": block_idx})
     job.output_stale = True
-    _event(session, job.id, "translation_edited", {"block_idx": block_idx})
 
 
 def render_job(session: Session, job_id: uuid.UUID) -> TranslationJob:

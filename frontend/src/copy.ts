@@ -25,6 +25,7 @@ export const ERROR_COPY: Record<string, string> = {
   path_outside_workspace: "That file path is outside the workspace.",
   source_unknown: "The source file for this download is not known. Pass an output path.",
   not_found: "That document or translation could not be found.",
+  invalid_edit: "That passage is not part of this translation.",
   unauthorized: "Sign in to continue.",
   csrf_failed: "The request was rejected. Refresh the page and try again.",
   too_many_attempts: "Too many attempts. Wait a few minutes and try again.",
@@ -49,11 +50,28 @@ export function sameNotice(message: string, detail: string): boolean {
   return left === right || right.startsWith(left) || left.startsWith(right);
 }
 
+const PIPELINE = ["queued", "extracting", "ocr", "translating", "reviewing", "rendering", "done"];
+
+export function progressRatio(done: number, total: number, status: string): number {
+  if (status === "done") return 100;
+  const fraction = total > 0 ? Math.min(1, Math.max(0, done / total)) : 0;
+  if (status === "failed" || status === "cancelled") return Math.round(fraction * 100);
+  if (status === "rendering") return 94;
+  if (status === "reviewing") return 86;
+  if (status === "translating") return Math.round(24 + fraction * 54);
+  if (status === "ocr") return 18;
+  if (status === "extracting") return 12;
+  if (status === "queued") return 6;
+  return Math.max(6, Math.round(fraction * 78));
+}
+
 export function progressLabel(done: number, total: number, status: string): string {
   if (status === "done") return "Translation complete";
   if (status === "failed") return "Translation failed";
   if (status === "cancelled") return "Translation cancelled";
+  const ratio = progressRatio(done, total, status);
+  if (status === "translating" && total > 0) return `${status} · ${done}/${total} segments · ${ratio}%`;
+  if (PIPELINE.includes(status)) return `${status} · ${ratio}%`;
   if (!total) return `Working · ${status}`;
-  const pct = Math.round((done / total) * 100);
-  return `${status} · ${done}/${total} segments · ${pct}%`;
+  return `${status} · ${done}/${total} segments · ${ratio}%`;
 }

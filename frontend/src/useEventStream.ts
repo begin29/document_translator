@@ -88,6 +88,37 @@ export function mergeState<T extends StateFields>(current: T, msg: StreamMessage
   };
 }
 
+const PIPELINE = ["queued", "extracting", "ocr", "translating", "reviewing", "rendering", "done"];
+
+export function forwardStatus(current: string, incoming: string): string {
+  if (incoming === "failed" || incoming === "cancelled") return incoming;
+  if (current === "failed") return incoming;
+  if (current === "cancelled" || current === "done") return current;
+  const left = PIPELINE.indexOf(current);
+  const right = PIPELINE.indexOf(incoming);
+  if (left === -1) return incoming;
+  if (right === -1) return current;
+  return right >= left ? incoming : current;
+}
+
+export function mergeJobRecord<T extends StateFields>(current: T | null | undefined, incoming: T): T {
+  if (!current) return incoming;
+  const currentStatus = current.status || "";
+  const incomingStatus = incoming.status || "";
+  const status = forwardStatus(currentStatus, incomingStatus);
+  return applySnapshot(
+    current,
+    {
+      ...incoming,
+      status,
+      done_segments: Math.max(current.done_segments ?? 0, incoming.done_segments ?? 0),
+      total_segments: Math.max(current.total_segments ?? 0, incoming.total_segments ?? 0),
+      cost_cents: Math.max(current.cost_cents ?? 0, incoming.cost_cents ?? 0),
+    },
+    "job",
+  );
+}
+
 export function applySnapshot<T extends StateFields>(current: T | undefined, incoming: T, kind: "job" | "document"): T {
   if (!current) return incoming;
   const previous = kind === "job" ? current.status : current.analysis_status;
@@ -244,6 +275,7 @@ export function openEventStream(handlers: OpenHandlers): StreamSession {
     if (listeners.size === 0) haltSocket();
   };
   ensure();
+  safeCall(listener.fetchState);
   return session;
 }
 

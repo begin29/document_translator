@@ -15,6 +15,15 @@ export default {
       fontFamily: {
         sans: ["Inter", "Helvetica Neue", "Arial", "sans-serif"],
       },
+      keyframes: {
+        indeterminate: {
+          "0%": { transform: "translateX(0%)" },
+          "100%": { transform: "translateX(150%)" },
+        },
+      },
+      animation: {
+        indeterminate: "indeterminate 1.2s ease-in-out infinite alternate",
+      },
     },
   },
   plugins: [],
